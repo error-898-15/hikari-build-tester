@@ -97,7 +97,12 @@ object SubtitleCues {
         val hint = StringBuilder()
     }
 
-    fun parse(raw: String): List<DubCue> {
+    /**
+     * [multi] = true: find who is speaking and split "- Hi / - Hello" turns.
+     * [multi] = false: the names / dashes are only removed, every line is
+     * read in one plain voice.
+     */
+    fun parse(raw: String, multi: Boolean = true): List<DubCue> {
         val text = raw.removePrefix("\uFEFF").replace("\r\n", "\n").replace('\r', '\n')
 
         // 1) blocks -> raw cues
@@ -134,14 +139,14 @@ object SubtitleCues {
                 var newTurn = false
                 if (DASH_TURN.containsMatchIn(line)) {
                     line = DASH_LEAD.replace(line, "")
-                    newTurn = true
+                    newTurn = multi
                 }
                 var speaker: String? = null
                 var body = line
                 var hint = ""
                 val lbl = labelOf(line)
                 if (lbl != null && accepted(lbl, counts)) {
-                    speaker = lbl.name
+                    speaker = if (multi) lbl.name else null
                     body = lbl.rest
                     hint = lbl.hint
                 }
