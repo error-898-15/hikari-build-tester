@@ -2,6 +2,9 @@ package com.hikari.app.reader.cache
 
 import android.graphics.BitmapFactory
 import com.hikari.app.reader.source.MangaSource
+import com.hikari.app.translate.MangaTranslateSettings
+import com.hikari.app.translate.PageTranslation
+import com.hikari.app.translate.TranslateConfig
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
@@ -57,9 +60,18 @@ object WebtoonPageCache {
     private const val EVICT_EVERY_N_WRITES = 25
     private val writesSinceEvict = AtomicInteger(0)
 
-    fun keyFor(imageUrl: String): String {
+    fun keyFor(imageUrl: String): String = keyFor(imageUrl, MangaTranslateSettings.current)
+
+    /**
+     * The file name a page lives under. While manga translation is on, the language/engine
+     * choice is part of it (see [TranslateConfig.cacheTag]) so every choice keeps its own copy
+     * of a page; while it is off the tag is empty and this is exactly the old name.
+     */
+    private fun keyFor(imageUrl: String, cfg: TranslateConfig): String {
+        val tag = cfg.cacheTag
+        val seed = if (tag.isEmpty()) imageUrl else "$imageUrl|$tag"
         val digest = MessageDigest.getInstance("SHA-256")
-            .digest(imageUrl.toByteArray())
+            .digest(seed.toByteArray())
             .take(8)
             .joinToString("") { String.format("%02x", it) }
         return digest
@@ -84,9 +96,12 @@ object WebtoonPageCache {
         source: MangaSource,
         dir: File,
     ): File {
-        val key = keyFor(desc.imageUrl)
+        // One snapshot of the translate settings for this whole call, so the file name and the
+        // decision to translate cannot disagree if the user flips a switch mid-download.
+        val cfg = MangaTranslateSettings.current
+        val key = keyFor(desc.imageUrl, cfg)
         val target = targetFile(key, dir)
-        if (target.exists() && target.length() > 0) return target
+        if (target.exists() && target.length() > 0 && !PageTranslation.needsRetry(target, cfg)) return target
 
         val existing = inFlight[key]
         if (existing != null) return existing.await()
@@ -101,10 +116,19 @@ object WebtoonPageCache {
             try {
                 val downloaded = withContext(Dispatchers.IO) {
                     dir.mkdirs()
-                    val tmp = File(dir, "$key.tmp")
-                    tmp.delete()
-                    source.downloadPageImage(desc, tmp)
-                    tmp.renameTo(target)
+                    if (target.exists() && target.length() > 0) {
+                        // A half-translated page being retried: translate the saved original
+                        // again, no download.
+                        PageTranslation.place(PageTranslation.retrySource(target), target, cfg)
+                    } else {
+                        val tmp = File(dir, "$key.tmp")
+                        tmp.delete()
+                        source.downloadPageImage(desc, tmp)
+                        // Moves tmp to `target` -- translated first when Settings ->
+                        // Translate/Dub has it on.
+                        PageTranslation.place(tmp, target, cfg)
+                    }
+                    if (!target.exists() || target.length() == 0L) throw IOException("Page was not written")
                     target
                 }
                 maybeEvict(dir)
@@ -235,6 +259,8 @@ object WebtoonPageCache {
             if (toFree <= 0) break
             toFree -= f.length()
             f.delete()
+            // The saved original of a half-translated page goes with it.
+            PageTranslation.retrySource(f).delete()
         }
     }
 }
