@@ -20,23 +20,20 @@ import kotlin.math.abs
 enum class VoiceMode { AUTO, GOOGLE, LOCAL }
 
 /**
- * Dubs a video from its subtitle:
+ * Dubs a video from its subtitle file:
  *
- *   cue ──translate──▶ text in the chosen language ──TTS──▶ audio clip (one voice)
- *                                                              │
- *   character ──▶ pitch / speed profile (male, female, child…) │
- *   player position ───── plays the clip when its cue starts ◀─┘
+ *   subtitle cue ──translate──▶ text in the chosen language ──TTS──▶ audio clip
+ *                                                                      │
+ *   player position ──────────── plays the clip when its cue starts ◀──┘
  *
- * Two ways of getting the cues:
- *  - FILE mode: the whole subtitle text is known. Only the next [LOOKAHEAD_MS]
- *    are translated and voiced, so starting is instant and the voice is
- *    exactly in time.
- *  - LIVE mode: the subtitle is a track inside the video file (no file to
- *    read). Lines are captured as the player shows them ([feedLive]) and
- *    voiced straight away, so the voice starts about a second after the
- *    line appears. Lines already seen are remembered, so rewinding is exact.
+ * Nothing is processed up front. Only the cues in the next [LOOKAHEAD_MS] of
+ * playback are translated and voiced (a few at a time), so starting is instant,
+ * a 2-hour film does not hammer Google, and a seek just moves the window.
  *
- * The original soundtrack is lowered ("ducked") while a clip speaks.
+ * The original soundtrack is lowered ("ducked") while a clip speaks and
+ * restored afterwards. A clip longer than its cue is sped up (max
+ * [MAX_SPEED]x) so the voice does not run into the next line.
+ *
  * All public methods must be called from the main thread.
  */
 class DubEngine(
@@ -53,75 +50,51 @@ class DubEngine(
     /** Short messages for the user (shown as a toast by the caller). */
     private val onStatus: (String) -> Unit,
 ) {
-    /** A voiced line. [file] is null when there is nothing to say. */
-    private class Ready(val file: File?, val pitch: Float, val speed: Float)
-
     private val google = GoogleTtsVoice(context)
     private val local = LocalTtsVoice(context)
 
-    private val cues = ArrayList<DubCue>()
-    private var live = false
-    private var multiVoice = true
-    private var cast = VoiceCast()
-    private val labelSeen = HashMap<String, Int>()
-    private var nextId = 0
-    private var liveOpenId = -1
-    private var liveOpenText = ""
-
+    private var cues: List<DubCue> = emptyList()
     private var lang = "en"
     private var mode = VoiceMode.AUTO
     private var duck = 0.15f
 
+    /** True = every character gets its own voice and the clips are edited
+     *  (pitch, speed, loudness). False = the plain voice, as before. */
+    @Volatile private var smart = true
+    @Volatile private var cast: Cast = Cast(emptyList())
+    private val dir = File(context.cacheDir, "dub").apply { mkdirs() }
+
     private var loop: Job? = null
     private val gate = Semaphore(3)
-    private val ready = ConcurrentHashMap<Int, Ready>()
+    private val ready = ConcurrentHashMap<Int, File>()
     private val inFlight = ConcurrentHashMap.newKeySet<Int>()
     private val failed = ConcurrentHashMap.newKeySet<Int>()
     private var failureNoticeShown = false
 
     private var clip: MediaPlayer? = null
     private var clipToken = 0
-    private var clipStarted = false
-    /** True while WE lowered the original sound, so we only restore what we changed. */
-    private var ducked = false
-    private var spokenId = -1
+    private var spokenIdx = -1
     private var lastPos = 0L
 
     val active: Boolean get() = loop?.isActive == true
     var activeLang: String = ""
         private set
 
-    fun start(
-        newCues: List<DubCue>,
-        lang: String,
-        mode: VoiceMode,
-        duckVolume: Float,
-        multiVoice: Boolean,
-        live: Boolean,
-    ) {
+    fun start(cues: List<DubCue>, lang: String, mode: VoiceMode, duckVolume: Float) {
         stop()
-        if (!live && newCues.isEmpty()) {
+        if (cues.isEmpty()) {
             onStatus("No readable lines in that subtitle.")
             return
         }
+        this.cues = cues
         this.lang = lang
         this.mode = mode
         this.duck = duckVolume.coerceIn(0f, 1f)
-        this.multiVoice = multiVoice
-        this.live = live
-        cues.addAll(newCues)
-        nextId = (newCues.maxOfOrNull { it.id } ?: -1) + 1
-        cast = VoiceCast()
-        labelSeen.clear()
-        if (multiVoice) {
-            // Give every character a voice in order of first appearance, so the
-            // casting is the same however the person seeks around.
-            for (c in cues) cast.profileFor(c.speaker)
-            cast.summary()?.let { onStatus(it) }
-        }
+        this.smart = DubPrefs.smart(context)
+        this.cast = if (smart) CastDirector.assign(cues) else Cast(emptyList())
         activeLang = lang
         failureNoticeShown = false
-        spokenId = -1
+        spokenIdx = -1
         lastPos = effectivePos()
         loop = scope.launch(Dispatchers.Main) {
             var sincePrefetch = PREFETCH_EVERY_MS   // prefetch on the very first tick
@@ -141,12 +114,9 @@ class DubEngine(
         loop?.cancel()
         loop = null
         stopClip()
-        cues.clear()
         ready.clear()
         inFlight.clear()
         failed.clear()
-        liveOpenId = -1
-        liveOpenText = ""
         activeLang = ""
     }
 
@@ -156,51 +126,9 @@ class DubEngine(
         local.release()
     }
 
-    // ───────────────────────── live capture ─────────────────────────
-
-    /**
-     * LIVE mode: the text of the caption on screen right now, or null when
-     * nothing is shown. Called whenever the player changes its caption.
-     */
-    fun feedLive(rawText: String?) {
-        if (!active || !live) return
-        val pos = positionMs()
-        val key = rawText?.trim().orEmpty()
-        if (key == liveOpenText) return
-
-        // The line that was on screen has just ended: now we know how long it was.
-        if (liveOpenId >= 0) {
-            val i = cues.indexOfFirst { it.id == liveOpenId }
-            if (i >= 0) cues[i] = cues[i].copy(endMs = maxOf(pos, cues[i].startMs + 400L))
-            liveOpenId = -1
-        }
-        liveOpenText = key
-        if (key.isEmpty()) return
-
-        var t = pos
-        for (turn in SubtitleCues.liveTurns(key, labelSeen)) {
-            val est = (turn.text.length * 65L).coerceIn(1200L, 8000L)
-            // Seen before (the person rewound)? Reuse the voiced clip.
-            val dup = cues.firstOrNull { abs(it.startMs - t) < 900L && it.text == turn.text }
-            if (dup != null) {
-                liveOpenId = dup.id
-                t += est
-                continue
-            }
-            val c = DubCue(nextId++, t, t + est, turn.text, turn.speaker, turn.shout)
-            val at = cues.indexOfFirst { it.startMs > c.startMs }
-            if (at < 0) cues += c else cues.add(at, c)
-            if (multiVoice) cast.profileFor(c.speaker)
-            liveOpenId = c.id
-            t += est
-            schedule(c)
-        }
-    }
-
     // ───────────────────────── playback ─────────────────────────
 
-    private fun effectivePos(): Long =
-        if (live) positionMs() else positionMs() - offsetMs()
+    private fun effectivePos() = positionMs() - offsetMs()
 
     private fun tick() {
         val pos = effectivePos()
@@ -208,7 +136,7 @@ class DubEngine(
         // Seek detection: ticks are 100 ms apart, so a bigger jump is a seek.
         if (pos < lastPos - 300L || pos > lastPos + 2_500L) {
             stopClip()
-            spokenId = -1
+            spokenIdx = -1
         }
         lastPos = pos
 
@@ -222,22 +150,14 @@ class DubEngine(
         if (!isPlaying()) return
 
         val idx = cueIndexAt(pos)
-        if (idx < 0) return
+        if (idx < 0 || idx == spokenIdx) return
         val cue = cues[idx]
-        if (cue.id == spokenId) return
-        val tooLate = if (live) pos > cue.endMs + LIVE_GRACE_MS else pos >= cue.endMs - 300L
-        if (tooLate) return
-        val r = ready[cue.id] ?: return              // not voiced yet; try again next tick
-        spokenId = cue.id
-        val file = r.file ?: return                  // nothing to say for this line
-
+        if (pos >= cue.endMs - 300L) return          // too late to start this one
+        val file = ready[idx] ?: return              // not voiced yet; try again next tick
+        spokenIdx = idx
         val nextStart = cues.getOrNull(idx + 1)?.startMs ?: Long.MAX_VALUE
-        val windowMs = if (live) {
-            (cue.endMs + 900L - pos).coerceAtLeast(1_400L)
-        } else {
-            (minOf(nextStart, cue.endMs + 700L) - pos).coerceAtLeast(600L)
-        }
-        playClip(file, windowMs, r)
+        val windowMs = (minOf(nextStart, cue.endMs + 700L) - pos).coerceAtLeast(600L)
+        playClip(file, windowMs)
     }
 
     /** Index of the last cue that starts at or before [pos], or -1. */
@@ -252,7 +172,12 @@ class DubEngine(
         return ans
     }
 
-    private fun playClip(file: File, windowMs: Long, r: Ready) {
+    private var clipStarted = false
+    /** True while the original sound is lowered by us — so we only ever restore
+     *  a volume we changed (never un-mute a player the app silenced itself). */
+    private var ducked = false
+
+    private fun playClip(file: File, windowMs: Long) {
         stopClip()
         val token = ++clipToken
         val mp = MediaPlayer()
@@ -268,17 +193,15 @@ class DubEngine(
             mp.setDataSource(file.path)
             mp.setOnPreparedListener { p ->
                 if (token != clipToken) return@setOnPreparedListener
-                val clipMs = p.duration.toLong().coerceAtLeast(1L)
-                // The character's own speed, sped up further only if the line
-                // would otherwise run into the next one.
-                val rate = maxOf(r.speed, clipMs.toFloat() / windowMs).coerceIn(0.85f, MAX_SPEED)
-                runCatching { p.playbackParams = PlaybackParams().setSpeed(rate).setPitch(r.pitch) }
+                val clipMs = p.duration.toLong()
+                if (clipMs > windowMs) {
+                    val rate = (clipMs.toFloat() / windowMs).coerceIn(1f, MAX_SPEED)
+                    runCatching { p.playbackParams = PlaybackParams().setSpeed(rate) }
+                }
                 setOriginalVolume(duck)
                 ducked = true
                 clipStarted = true
-                // Some Android versions start playing when the params are set:
-                // make the state match the video either way.
-                if (isPlaying()) { if (!p.isPlaying) p.start() } else runCatching { p.pause() }
+                if (isPlaying()) p.start()
             }
             mp.setOnCompletionListener { if (token == clipToken) stopClip() }
             mp.setOnErrorListener { _, _, _ -> if (token == clipToken) stopClip(); true }
@@ -303,59 +226,69 @@ class DubEngine(
 
     private fun prefetch() {
         val pos = effectivePos()
-        var i = cueIndexAt(pos - 500L).coerceAtLeast(0)
+        val from = cueIndexAt(pos - 500L).coerceAtLeast(0)
+        var i = from
         while (i < cues.size && cues[i].startMs <= pos + LOOKAHEAD_MS) {
-            val cue = cues[i]
+            val idx = i
             i++
-            if (cue.endMs < pos - 500L) continue
-            schedule(cue)
-        }
-    }
-
-    /** Translates and voices one cue in the background. Main thread only. */
-    private fun schedule(cue: DubCue) {
-        if (ready.containsKey(cue.id) || failed.contains(cue.id) || !inFlight.add(cue.id)) return
-        val profile = if (multiVoice) cast.profileFor(cue.speaker) else VoiceCast.NARRATOR
-        scope.launch(Dispatchers.IO) {
-            try {
-                gate.withPermit {
-                    if (!isActive || !active) return@withPermit
-                    val r = prepare(cue, profile)
-                    if (r != null) {
-                        ready[cue.id] = r
-                    } else {
-                        failed.add(cue.id)
-                        // Retry later: a rate-limit is temporary.
-                        scope.launch { delay(RETRY_AFTER_MS); failed.remove(cue.id) }
-                        noticeFailureOnce()
+            if (cues[idx].endMs < pos - 500L) continue
+            if (ready.containsKey(idx) || failed.contains(idx) || !inFlight.add(idx)) continue
+            scope.launch(Dispatchers.IO) {
+                try {
+                    gate.withPermit {
+                        if (!isActive || !active) return@withPermit
+                        val file = prepare(idx)
+                        if (file != null) ready[idx] = file
+                        else {
+                            failed.add(idx)
+                            // Retry later: a rate-limit is temporary.
+                            scope.launch { delay(RETRY_AFTER_MS); failed.remove(idx) }
+                            noticeFailureOnce()
+                        }
                     }
+                } finally {
+                    inFlight.remove(idx)
                 }
-            } finally {
-                inFlight.remove(cue.id)
             }
         }
     }
 
-    private suspend fun prepare(cue: DubCue, profile: VoiceProfile): Ready? {
+    private suspend fun prepare(idx: Int): File? {
+        val cue = cues[idx]
         val translated = Translator.translateTo(cue.text, lang).ifBlank { cue.text }
-        val spoken = Prosody.forSpeech(translated)
-        if (spoken.isBlank()) return Ready(null, 1f, 1f)
-        val mood = Prosody.mood(spoken, cue.shout)
+        val spoken = SubtitleCues.forSpeech(translated)
+        if (spoken.isBlank()) return null
         val voices = when (mode) {
             VoiceMode.GOOGLE -> listOf(google)
             VoiceMode.LOCAL -> listOf(local)
             VoiceMode.AUTO -> listOf(google, local)
         }
+        var raw: File? = null
         for (v in voices) {
             if (!v.isAvailable(lang)) continue
-            val file = v.synthesize(spoken, lang) ?: continue
-            return Ready(
-                file,
-                (profile.pitch * mood.pitch).coerceIn(0.6f, 1.6f),
-                (profile.speed * mood.speed).coerceIn(0.8f, 1.4f),
-            )
+            raw = v.synthesize(spoken, lang)
+            if (raw != null) break
         }
-        return null
+        val rawClip = raw ?: return null
+        if (!smart) return rawClip
+
+        // Give the line its character's voice. Any problem => the plain clip.
+        val profile = cast.profileFor(cue)
+        val fitMs = fitWindowMs(idx)
+        val name = GoogleTtsVoice.key(
+            "fx", lang,
+            rawClip.name + "|" + profile.key + "|" + cue.emotion.name + "|" + (fitMs / 100L),
+        ) + ".wav"
+        val out = File(dir, name)
+        if (out.exists() && out.length() > 0) return out
+        return if (DubFx.process(rawClip, out, profile, cue.emotion, fitMs)) out else rawClip
+    }
+
+    /** Time the line has before the next one starts (same rule as [tick]). */
+    private fun fitWindowMs(idx: Int): Long {
+        val cue = cues[idx]
+        val nextStart = cues.getOrNull(idx + 1)?.startMs ?: Long.MAX_VALUE
+        return (minOf(nextStart, cue.endMs + 700L) - cue.startMs).coerceAtLeast(600L)
     }
 
     private fun noticeFailureOnce() {
@@ -378,7 +311,6 @@ class DubEngine(
         private const val PREFETCH_EVERY_MS = 700L
         private const val LOOKAHEAD_MS = 40_000L
         private const val RETRY_AFTER_MS = 15_000L
-        private const val LIVE_GRACE_MS = 3_500L
         private const val MAX_SPEED = 1.6f
     }
 }
