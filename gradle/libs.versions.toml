@@ -62,6 +62,11 @@ camerax = "1.4.2"
 # "no sensor" apart from "sensor but nothing enrolled" — which is the difference
 # between hiding the fingerprint button and showing it.
 biometric = "1.1.0"
+# On-device manga translation (Settings -> Translate/Dub). Same versions the
+# Kotatsu build this feature was written against uses.
+mlkitRecognition = "16.0.1"
+mlkitTranslate = "17.0.3"
+mlkitLangId = "17.0.6"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -136,6 +141,18 @@ androidx-camera-view = { group = "androidx.camera", name = "camera-view", versio
 # signal it locks again on (ProcessLifecycleOwner — see AppLockGate).
 androidx-biometric = { group = "androidx.biometric", name = "biometric", version.ref = "biometric" }
 androidx-lifecycle-process = { group = "androidx.lifecycle", name = "lifecycle-process", version.ref = "lifecycle" }
+
+# ---- Manga page translation (com.hikari.app.translate) ----
+# One OCR model per script, because ML Kit ships a separate recognizer for each.
+mlkit-ocr-latin = { group = "com.google.mlkit", name = "text-recognition", version.ref = "mlkitRecognition" }
+mlkit-ocr-japanese = { group = "com.google.mlkit", name = "text-recognition-japanese", version.ref = "mlkitRecognition" }
+mlkit-ocr-chinese = { group = "com.google.mlkit", name = "text-recognition-chinese", version.ref = "mlkitRecognition" }
+mlkit-ocr-korean = { group = "com.google.mlkit", name = "text-recognition-korean", version.ref = "mlkitRecognition" }
+mlkit-ocr-devanagari = { group = "com.google.mlkit", name = "text-recognition-devanagari", version.ref = "mlkitRecognition" }
+mlkit-langid = { group = "com.google.mlkit", name = "language-id", version.ref = "mlkitLangId" }
+mlkit-translate = { group = "com.google.mlkit", name = "translate", version.ref = "mlkitTranslate" }
+# Task<T>.await() for the ML Kit calls above.
+kotlinx-coroutines-play-services = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-play-services", version.ref = "coroutines" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
