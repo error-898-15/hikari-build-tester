@@ -18,7 +18,7 @@ import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 
-enum class VoiceMode { AUTO, GOOGLE, LOCAL }
+enum class VoiceMode { AUTO, GOOGLE, LOCAL, NEURAL }
 
 /**
  * Dubs a video from its subtitle file:
@@ -53,6 +53,7 @@ class DubEngine(
 ) {
     private val google = GoogleTtsVoice(context)
     private val local = LocalTtsVoice(context)
+    private val neural = SherpaTtsVoice(context)
 
     private var cues: List<DubCue> = emptyList()
     private var lang = "en"
@@ -83,6 +84,8 @@ class DubEngine(
 
     /** True when this run reads captions live (see [feedLive]) instead of a cue list. */
     private var liveMode = false
+    /** How far ahead lines are prepared; the neural voice is slower, so it starts earlier. */
+    private var lookaheadMs = LOOKAHEAD_MS
     private var liveText: String? = null
     private var liveToken = 0
 
@@ -110,6 +113,11 @@ class DubEngine(
         this.duck = duckVolume.coerceIn(0f, 1f)
         this.smart = multi
         this.liveMode = live
+        neural.resetCast()
+        val neuralLikely = (mode == VoiceMode.NEURAL || mode == VoiceMode.AUTO) &&
+            lang.substringBefore('-').equals("hi", ignoreCase = true) &&
+            SherpaModels.isInstalled(context)
+        lookaheadMs = if (neuralLikely) NEURAL_LOOKAHEAD_MS else LOOKAHEAD_MS
         this.cast = if (smart && !live) CastDirector.assign(cues) else Cast(emptyList())
         activeLang = lang
         failureNoticeShown = false
@@ -145,6 +153,7 @@ class DubEngine(
     fun release() {
         stop()
         local.release()
+        neural.release()
     }
 
     /**
@@ -288,7 +297,7 @@ class DubEngine(
         val pos = effectivePos()
         val from = cueIndexAt(pos - 500L).coerceAtLeast(0)
         var i = from
-        while (i < cues.size && cues[i].startMs <= pos + LOOKAHEAD_MS) {
+        while (i < cues.size && cues[i].startMs <= pos + lookaheadMs) {
             val idx = i
             i++
             if (cues[idx].endMs < pos - 500L) continue
@@ -319,29 +328,39 @@ class DubEngine(
         val translated = Translator.translateTo(cue.text, lang).ifBlank { cue.text }
         val spoken = SubtitleCues.forSpeech(translated)
         if (spoken.isBlank()) return null
+        // Which character speaks (and so which actor / pitch / speed).
+        val profile = if (smart) cast.profileFor(cue) else CastDirector.NARRATOR
         val voices = when (mode) {
             VoiceMode.GOOGLE -> listOf(google)
             VoiceMode.LOCAL -> listOf(local)
-            VoiceMode.AUTO -> listOf(google, local)
+            // The neural voice only answers when its model is installed and
+            // the language is supported; otherwise the next one is used.
+            VoiceMode.AUTO, VoiceMode.NEURAL -> listOf<DubVoice>(neural, google, local)
         }
         var raw: File? = null
+        var fromNeural = false
         for (v in voices) {
             if (!v.isAvailable(lang)) continue
-            raw = v.synthesize(spoken, lang)
-            if (raw != null) break
+            raw = v.synthesize(spoken, lang, profile)
+            if (raw != null) {
+                fromNeural = v === neural
+                break
+            }
         }
         val rawClip = raw ?: return null
         if (!smart) return rawClip
 
         // Give the line its character's voice. Any problem => the plain clip.
-        val profile = cast.profileFor(cue)
+        // A neural actor is already a real man / woman, so the pitch change is
+        // kept small (only enough to tell two characters of one actor apart).
+        val fx = if (fromNeural) profile.copy(semitones = profile.semitones * 0.35f) else profile
         val name = GoogleTtsVoice.key(
             "fx", lang,
-            rawClip.name + "|" + profile.key + "|" + cue.emotion.name + "|" + (fitMs / 100L),
+            rawClip.name + "|" + fx.key + "|" + cue.emotion.name + "|" + (fitMs / 100L) + "|" + fromNeural,
         ) + ".wav"
         val out = File(dir, name)
         if (out.exists() && out.length() > 0) return out
-        return if (DubFx.process(rawClip, out, profile, cue.emotion, fitMs)) out else rawClip
+        return if (DubFx.process(rawClip, out, fx, cue.emotion, fitMs)) out else rawClip
     }
 
     /** Time the line has before the next one starts (same rule as [tick]). */
@@ -370,6 +389,7 @@ class DubEngine(
         private const val TICK_MS = 100L
         private const val PREFETCH_EVERY_MS = 700L
         private const val LOOKAHEAD_MS = 40_000L
+        private const val NEURAL_LOOKAHEAD_MS = 150_000L
         private const val RETRY_AFTER_MS = 15_000L
         private const val MAX_SPEED = 1.6f
     }
