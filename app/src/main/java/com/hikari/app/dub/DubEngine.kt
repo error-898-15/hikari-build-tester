@@ -13,6 +13,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
@@ -80,9 +81,26 @@ class DubEngine(
     var activeLang: String = ""
         private set
 
-    fun start(cues: List<DubCue>, lang: String, mode: VoiceMode, duckVolume: Float) {
+    /** True when this run reads captions live (see [feedLive]) instead of a cue list. */
+    private var liveMode = false
+    private var liveText: String? = null
+    private var liveToken = 0
+
+    /**
+     * [multi] = a different voice for every character.
+     * [live] = there is no subtitle text to read in advance (the subtitle is
+     * inside the video): lines are voiced when [feedLive] hands them over.
+     */
+    fun start(
+        cues: List<DubCue>,
+        lang: String,
+        mode: VoiceMode,
+        duckVolume: Float,
+        multi: Boolean = true,
+        live: Boolean = false,
+    ) {
         stop()
-        if (cues.isEmpty()) {
+        if (cues.isEmpty() && !live) {
             onStatus("No readable lines in that subtitle.")
             return
         }
@@ -90,8 +108,9 @@ class DubEngine(
         this.lang = lang
         this.mode = mode
         this.duck = duckVolume.coerceIn(0f, 1f)
-        this.smart = DubPrefs.smart(context)
-        this.cast = if (smart) CastDirector.assign(cues) else Cast(emptyList())
+        this.smart = multi
+        this.liveMode = live
+        this.cast = if (smart && !live) CastDirector.assign(cues) else Cast(emptyList())
         activeLang = lang
         failureNoticeShown = false
         spokenIdx = -1
@@ -113,6 +132,8 @@ class DubEngine(
     fun stop() {
         loop?.cancel()
         loop = null
+        liveToken++
+        liveText = null
         stopClip()
         ready.clear()
         inFlight.clear()
@@ -124,6 +145,45 @@ class DubEngine(
     fun release() {
         stop()
         local.release()
+    }
+
+    /**
+     * LIVE mode: the caption that is on screen right now (null / empty = none).
+     * A new line is cleaned, translated, voiced and played at once; a line that
+     * is already being read is not repeated. Main thread only.
+     */
+    fun feedLive(text: String?) {
+        if (!active || !liveMode) return
+        val t = text?.trim().orEmpty()
+        if (t.isEmpty()) {
+            liveText = null          // caption gone; a clip that is speaking may finish
+            return
+        }
+        if (t == liveText) return
+        liveText = t
+
+        // Reuse the subtitle cleaner: wrap the caption as a one-line subtitle.
+        val parsed = SubtitleCues.parse(
+            "1\n00:00:00,000 --> 00:00:10,000\n" + t.replace("\n\n", "\n"),
+            smart,
+        )
+        if (parsed.isEmpty()) return
+        val first = parsed.first()
+        val body = parsed.joinToString(" ") { it.text }
+        val windowMs = (body.length * 65L).coerceIn(1_200L, 6_000L)
+        val cue = DubCue(0L, windowMs, body, first.speaker, first.turn, first.emotion)
+
+        val token = ++liveToken
+        scope.launch(Dispatchers.IO) {
+            val file = gate.withPermit {
+                if (token != liveToken || !active) null else prepareCue(cue, windowMs)
+            }
+            withContext(Dispatchers.Main) {
+                if (token != liveToken || !active) return@withContext
+                if (file != null) playClip(file, windowMs)
+                else noticeFailureOnce()
+            }
+        }
     }
 
     // ───────────────────────── playback ─────────────────────────
@@ -253,8 +313,9 @@ class DubEngine(
         }
     }
 
-    private suspend fun prepare(idx: Int): File? {
-        val cue = cues[idx]
+    private suspend fun prepare(idx: Int): File? = prepareCue(cues[idx], fitWindowMs(idx))
+
+    private suspend fun prepareCue(cue: DubCue, fitMs: Long): File? {
         val translated = Translator.translateTo(cue.text, lang).ifBlank { cue.text }
         val spoken = SubtitleCues.forSpeech(translated)
         if (spoken.isBlank()) return null
@@ -274,7 +335,6 @@ class DubEngine(
 
         // Give the line its character's voice. Any problem => the plain clip.
         val profile = cast.profileFor(cue)
-        val fitMs = fitWindowMs(idx)
         val name = GoogleTtsVoice.key(
             "fx", lang,
             rawClip.name + "|" + profile.key + "|" + cue.emotion.name + "|" + (fitMs / 100L),
