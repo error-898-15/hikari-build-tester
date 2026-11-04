@@ -197,6 +197,9 @@ import com.hikari.app.ui.LoadingEffects
 import com.hikari.app.ui.LoadingStyles
 import com.hikari.app.ui.PosterEffects
 import com.hikari.app.ui.PosterTypes
+import com.hikari.app.translate.MangaTranslateSettings
+import com.hikari.app.translate.TranslateConfig
+import com.hikari.app.translate.TranslateOptions
 import com.hikari.app.ui.components.ChoiceDialog
 import com.hikari.app.ui.components.ChoiceItem
 import com.hikari.app.ui.components.ChoiceRow
@@ -328,6 +331,17 @@ private enum class SettingsFolder(
         "Playback & Servers",
         "Where servers come from & when playback starts",
         Icons.Filled.SmartDisplay,
+    ),
+    // Reading a manga in a language you know: the on-device page translator
+    // (OCR + translation + typesetting, see com.hikari.app.translate). Its own
+    // folder rather than a corner of Player or Content, because the user looking
+    // for it is thinking "translate", not "reader" or "filter". Named
+    // Translate/Dub so the dubbing options can live beside it later.
+    TRANSLATE_DUB(
+        "translate-dub",
+        "Translate/Dub",
+        "Manga page translation & languages",
+        Icons.Filled.Translate,
     ),
     NETWORK(
         "network",
@@ -621,6 +635,7 @@ private fun searchSettings(rawQuery: String): List<SettingsSearchEntry> {
         "customize" to "customize personalize player ui buttons icon size colour color shape",
         "player" to "player video audio subtitles controls gestures loading enhance",
         "servers" to "playback servers play search extensions wait ask scope",
+        "translate-dub" to "translate dub translation manga page ocr language gemini google mlkit english hindi bengali",
         "network" to "network dns slow internet",
         "sources" to "sources extensions repos userscripts verification",
         "content" to "content adult nsfw filter",
@@ -660,6 +675,7 @@ private fun searchSettings(rawQuery: String): List<SettingsSearchEntry> {
     section("sec-ask-where", "Ask where to play", servers, "servers", null, "player.start", "ask where play extension selected scope choice")
     section("sec-server-search", "Server search", servers, "servers", null, null, "server search all extensions nuvio stremio cloudstream hikari anymex aniyomi skystream sora vega choose")
     section("sec-tracker-servers", "Tracker servers", servers, "servers", null, null, "tracker servers search")
+    section("sec-manga-translate", "Translate manga pages", "Translate/Dub", "translate-dub", null, "translate.manga", "translate translation manga pages ocr original language engine gemini google mlkit api key model")
     section("sec-anime-meta", "Anime Metadata", "Integrations", "integrations", "integrations.anime", null, "anime manga manhwa manhua pornhwa adult metadata anilist simkl episodes")
     section("sec-tmdb", "TMDB Enrichment", "Integrations", "integrations", "integrations.tmdb", "integrations.tmdb.main", "tmdb artwork metadata episodes credits")
     section("sec-tmdb-mod", "TMDB modules", "Integrations", "integrations", "integrations.tmdb", "integrations.tmdb.modules", "tmdb modules artwork")
@@ -918,6 +934,9 @@ fun SettingsScreen(nav: NavHostController) {
                     // the same card used to show up in the Player folder too.
                     item { SettingsCard { PlaybackStartCard(app) } }
                     item { SettingsCard { ServerLayoutCard(app) } }
+                }
+                SettingsFolder.TRANSLATE_DUB -> {
+                    item { SettingsCard(top = 2.dp) { MangaTranslateCard(app) } }
                 }
                 SettingsFolder.NETWORK -> {
                     item {
@@ -4959,6 +4978,174 @@ private fun SlowConnectionCard(app: HikariApp) {
                 scope.launch { runCatching { app.store.setSlowTipEnabled(it) } }
             },
         )
+    }
+}
+
+@Composable
+private fun MangaTranslateCard(app: HikariApp) {
+    val scope = rememberCoroutineScope()
+    val cfg by remember { app.store.mangaTranslateFlow() }
+        .collectAsState(initial = MangaTranslateSettings.current)
+    var draftKey by remember { mutableStateOf("") }
+    var draftModel by remember { mutableStateOf("") }
+    // Which picker is open: "source", "target", "engine" or none.
+    var picker by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(cfg.geminiKey) { draftKey = cfg.geminiKey }
+    LaunchedEffect(cfg.geminiModel) { draftModel = cfg.geminiModel }
+
+    // The reader is told at once (its page-cache file names depend on these values),
+    // the store is written behind it.
+    fun change(next: TranslateConfig, save: suspend () -> Unit) {
+        MangaTranslateSettings.update(next)
+        scope.launch { runCatching { save() } }
+    }
+
+    val engine = TranslateOptions.ENGINES.firstOrNull { it.first == cfg.engine }
+
+    SettingsSection(
+        id = "translate.manga",
+        icon = Icons.Filled.Translate,
+        title = tr("Translate manga pages"),
+        summary = if (cfg.enabled) {
+            tr(TranslateOptions.sourceLabel(cfg.source)) + " \u2192 " + tr(TranslateOptions.targetLabel(cfg.target))
+        } else {
+            tr("Off")
+        },
+    ) {
+        SettingsToggle(
+            label = tr("Translate manga pages"),
+            supporting = tr("Replace the text on pages with a translation"),
+            checked = cfg.enabled,
+            onCheckedChange = { v -> change(cfg.copy(enabled = v)) { app.store.setMangaTranslateEnabled(v) } },
+        )
+        Text(
+            tr("Detect text on pages and replace it with a translation (on-device, first use downloads language models)"),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 4.dp),
+        )
+
+        Spacer(Modifier.height(14.dp))
+        Text(
+            tr("Original language"),
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Spacer(Modifier.height(6.dp))
+        ChoiceRow(
+            value = tr(TranslateOptions.sourceLabel(cfg.source)),
+            leadingIcon = Icons.Filled.Language,
+            onClick = { picker = "source" },
+        )
+
+        Spacer(Modifier.height(14.dp))
+        Text(
+            tr("Translate to"),
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Spacer(Modifier.height(6.dp))
+        ChoiceRow(
+            value = tr(TranslateOptions.targetLabel(cfg.target)),
+            leadingIcon = Icons.Filled.Translate,
+            onClick = { picker = "target" },
+        )
+
+        Spacer(Modifier.height(14.dp))
+        Text(
+            tr("Translation engine"),
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Spacer(Modifier.height(6.dp))
+        ChoiceRow(
+            value = tr(engine?.second ?: cfg.engine),
+            supporting = engine?.let { tr(it.third) },
+            leadingIcon = Icons.Filled.Tune,
+            onClick = { picker = "engine" },
+        )
+
+        // The key and the model only matter to the Gemini engine, so they only appear for it.
+        if (cfg.engine == "gemini") {
+            Spacer(Modifier.height(14.dp))
+            Text(
+                tr("Gemini API key"),
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Text(
+                tr("Free key from aistudio.google.com. Needed only for the Gemini engine"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
+            )
+            ApiKeyEditor(
+                label = "Gemini API key",
+                value = draftKey,
+                savedValue = cfg.geminiKey,
+                onValueChange = { draftKey = it },
+                onSave = {
+                    val k = draftKey.trim()
+                    change(cfg.copy(geminiKey = k)) { app.store.setMangaTranslateGeminiKey(k) }
+                },
+            )
+
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(
+                value = draftModel,
+                onValueChange = { draftModel = it },
+                label = { Text(tr("Gemini model")) },
+                singleLine = true,
+                shape = GlassShape,
+                modifier = Modifier.fillMaxWidth().tvTextFieldKeys(draftModel),
+            )
+            val saveModel = {
+                val m = draftModel.trim().ifEmpty { TranslateConfig.DEFAULT_GEMINI_MODEL }
+                draftModel = m
+                change(cfg.copy(geminiModel = m)) { app.store.setMangaTranslateGeminiModel(m) }
+            }
+            TextButton(
+                onClick = saveModel,
+                enabled = draftModel.trim() != cfg.geminiModel.trim(),
+                modifier = Modifier.tvPress(previewPass = true, onClick = saveModel),
+            ) {
+                Text(if (draftModel.trim() == cfg.geminiModel.trim()) tr("Saved") else tr("Save"))
+            }
+        }
+    }
+
+    when (picker) {
+        "source" -> ChoiceDialog(
+            title = tr("Original language"),
+            items = TranslateOptions.SOURCES.map { ChoiceItem(it.first, tr(it.second)) },
+            selectedKey = cfg.source,
+            onPick = { code ->
+                picker = null
+                change(cfg.copy(source = code)) { app.store.setMangaTranslateSource(code) }
+            },
+            onDismiss = { picker = null },
+        )
+        "target" -> ChoiceDialog(
+            title = tr("Translate to"),
+            items = TranslateOptions.TARGETS.map { ChoiceItem(it.first, tr(it.second)) },
+            selectedKey = cfg.target,
+            onPick = { code ->
+                picker = null
+                change(cfg.copy(target = code)) { app.store.setMangaTranslateTarget(code) }
+            },
+            onDismiss = { picker = null },
+        )
+        "engine" -> ChoiceDialog(
+            title = tr("Translation engine"),
+            items = TranslateOptions.ENGINES.map { ChoiceItem(it.first, tr(it.second), tr(it.third)) },
+            selectedKey = cfg.engine,
+            onPick = { key ->
+                picker = null
+                change(cfg.copy(engine = key)) { app.store.setMangaTranslateEngine(key) }
+            },
+            onDismiss = { picker = null },
+        )
+        else -> Unit
     }
 }
 
