@@ -194,6 +194,18 @@ class AppStore(private val ctx: Context) {
         val DOWNLOAD_CONCURRENCY = intPreferencesKey("downloadConcurrency")
         val SLOW_CONNECTION = booleanPreferencesKey("slowConnection")
 
+        // ---- Manga page translation (Settings -> Translate/Dub) ----
+        // Same meaning as the keys in the Kotatsu build this was written for:
+        // on/off, the language the pages are in ("auto" = detect), the language
+        // to translate to, the engine ("mlkit" | "google" | "gemini") and the
+        // Gemini key/model that engine needs.
+        val MT_ENABLED = booleanPreferencesKey("mangaTranslate")
+        val MT_SOURCE = stringPreferencesKey("mangaTranslateSource")
+        val MT_TARGET = stringPreferencesKey("mangaTranslateTarget")
+        val MT_ENGINE = stringPreferencesKey("mangaTranslateEngine")
+        val MT_GEMINI_KEY = stringPreferencesKey("mangaTranslateGeminiKey")
+        val MT_GEMINI_MODEL = stringPreferencesKey("mangaTranslateGeminiModel")
+
         /** Resolver chosen in Settings → Network and Internet → DNS mode
          *  ([com.hikari.app.net.DnsProviders] keys), and the address a Custom
          *  choice points at. */
@@ -2387,6 +2399,52 @@ fun searchExceptionOnFlow(): Flow<Boolean> =
 
     suspend fun setSlowConnection(enabled: Boolean) {
         write("SLOW_CONNECTION") { it[K.SLOW_CONNECTION] = enabled }
+    }
+
+    // ---------------------------------------------------------------------
+    // Manga page translation -- Settings -> Translate/Dub.
+    // The reader reads these through [com.hikari.app.translate.MangaTranslateSettings],
+    // which keeps one in-memory snapshot of them (the reader's page-cache key has
+    // to be computed synchronously, a DataStore read cannot be).
+    // ---------------------------------------------------------------------
+
+    fun mangaTranslateFlow(): Flow<com.hikari.app.translate.TranslateConfig> =
+        store.data.map { p ->
+            com.hikari.app.translate.TranslateConfig(
+                enabled = p[K.MT_ENABLED] ?: false,
+                source = p[K.MT_SOURCE] ?: "auto",
+                target = p[K.MT_TARGET] ?: "en",
+                engine = p[K.MT_ENGINE] ?: "mlkit",
+                geminiKey = (p[K.MT_GEMINI_KEY] ?: "").trim(),
+                geminiModel = (p[K.MT_GEMINI_MODEL] ?: "").trim()
+                    .ifEmpty { com.hikari.app.translate.TranslateConfig.DEFAULT_GEMINI_MODEL },
+            )
+        }.distinctUntilChanged().flowOn(Dispatchers.Default)
+
+    suspend fun mangaTranslate(): com.hikari.app.translate.TranslateConfig = mangaTranslateFlow().first()
+
+    suspend fun setMangaTranslateEnabled(enabled: Boolean) {
+        write("MT_ENABLED") { it[K.MT_ENABLED] = enabled }
+    }
+
+    suspend fun setMangaTranslateSource(code: String) {
+        write("MT_SOURCE") { it[K.MT_SOURCE] = code }
+    }
+
+    suspend fun setMangaTranslateTarget(code: String) {
+        write("MT_TARGET") { it[K.MT_TARGET] = code }
+    }
+
+    suspend fun setMangaTranslateEngine(engine: String) {
+        write("MT_ENGINE") { it[K.MT_ENGINE] = engine }
+    }
+
+    suspend fun setMangaTranslateGeminiKey(key: String) {
+        write("MT_GEMINI_KEY") { it[K.MT_GEMINI_KEY] = key.trim() }
+    }
+
+    suspend fun setMangaTranslateGeminiModel(model: String) {
+        write("MT_GEMINI_MODEL") { it[K.MT_GEMINI_MODEL] = model.trim() }
     }
 
     /** The chosen resolver ([com.hikari.app.net.DnsProviders] key). Default is
