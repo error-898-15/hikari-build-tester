@@ -530,6 +530,22 @@ dependencies {
     //    prompt every time a film ends.
     implementation(libs.androidx.biometric)
     implementation(libs.androidx.lifecycle.process)
+    // ---- Manga page translation (Settings -> Translate/Dub) ----
+    //
+    // On-device OCR (one ML Kit recognizer per script: Latin, Japanese, Chinese,
+    // Korean, Devanagari), language identification and offline translation. The
+    // code that uses them lives in com.hikari.app.translate. The recognizers
+    // bundle their models, which is what keeps OCR working with no network -- and
+    // is also why the APK grows when this is added.
+    implementation(libs.mlkit.ocr.latin)
+    implementation(libs.mlkit.ocr.japanese)
+    implementation(libs.mlkit.ocr.chinese)
+    implementation(libs.mlkit.ocr.korean)
+    implementation(libs.mlkit.ocr.devanagari)
+    implementation(libs.mlkit.langid)
+    implementation(libs.mlkit.translate)
+    // `Task.await()` -- ML Kit returns Google Play services Tasks.
+    implementation(libs.kotlinx.coroutines.play.services)
     debugImplementation(libs.androidx.compose.ui.tooling)
 }
 
