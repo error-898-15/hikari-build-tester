@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
 import android.view.View
+import android.view.WindowManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.CheckBox
@@ -239,6 +240,9 @@ internal object NeuralDownload {
             .setNegativeButton(I18n.t("Cancel")) { _, _ -> job?.cancel() }
             .create()
         dlg.show()
+        // keep the screen on while the voice pack downloads / unpacks, otherwise the phone
+        // sleeps and the work stops
+        dlg.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val running = scope.launch {
             val err = SherpaModels.install(activity.applicationContext) { pct, unpacking ->
