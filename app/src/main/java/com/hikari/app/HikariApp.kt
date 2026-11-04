@@ -416,6 +416,9 @@ class HikariApp : Application() {
         // the log could never answer which heap ran out (see [MemoryReport]).
         Logs.log("Memory", com.hikari.app.data.MemoryReport.device(this))
         providers = ProviderManager(store, this)
+        // Manga page translation (Settings → Translate/Dub): keep one in-memory copy of
+        // its settings for the reader's page cache. See MangaTranslateSettings.
+        com.hikari.app.translate.MangaTranslateSettings.start(this)
         // Profiles (Settings → Profiles): read the registry, and make the store
         // agree with the active profile. Normally that is a no-op — the store IS
         // the active profile's contents — but if the two were separated (the
