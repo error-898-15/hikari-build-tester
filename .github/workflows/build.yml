@@ -81,6 +81,52 @@ jobs:
           # dependency re-downloads but makes builds deterministic.
           cache-disabled: true
 
+      # ---- Offline neural voices for the Dub feature (sherpa-onnx) ----
+      # The native libraries (about 40 MB per processor) and the one Kotlin file
+      # that talks to them are NOT kept in this repository: this step fetches
+      # them from the official k2-fsa/sherpa-onnx release before every build.
+      # It also adds the two small build settings they need (a tar.bz2 reader
+      # for unpacking the voice pack, and keep-rules so shrinking leaves the
+      # native bindings alone). Safe to run again: each part checks first.
+      - name: Fetch sherpa-onnx (offline neural voices)
+        run: |
+          set -e
+          VER=1.12.13
+          WORK=/tmp/sherpa
+          rm -rf "$WORK" && mkdir -p "$WORK" && cd "$WORK"
+          curl -fsSL --retry 5 --retry-delay 10 -o android.tar.bz2 \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/v${VER}/sherpa-onnx-v${VER}-android.tar.bz2"
+          mkdir libs && tar xjf android.tar.bz2 -C libs
+          git clone --depth 1 --branch "v${VER}" https://github.com/k2-fsa/sherpa-onnx.git src
+          cd "$GITHUB_WORKSPACE"
+          for abi in arm64-v8a armeabi-v7a; do
+            SRC=$(find "$WORK/libs" -type d -name "$abi" -path "*jniLibs*" | head -n1)
+            if [ -z "$SRC" ]; then echo "::error::sherpa-onnx $abi libraries not found in the download"; exit 1; fi
+            mkdir -p "app/src/main/jniLibs/$abi"
+            cp "$SRC/libsherpa-onnx-jni.so" "$SRC/libonnxruntime.so" "app/src/main/jniLibs/$abi/"
+          done
+          TTS_KT=$(find "$WORK/src" -name Tts.kt -path "*kotlin-api*" | head -n1)
+          if [ -z "$TTS_KT" ]; then echo "::error::sherpa-onnx Tts.kt not found"; exit 1; fi
+          mkdir -p app/src/main/java/com/k2fsa/sherpa/onnx
+          cp "$TTS_KT" app/src/main/java/com/k2fsa/sherpa/onnx/Tts.kt
+          if ! grep -q "commons-compress" app/build.gradle.kts; then
+            printf '\ndependencies {\n    implementation("org.apache.commons:commons-compress:1.27.1")\n}\n' >> app/build.gradle.kts
+          fi
+          if ! grep -q "com.k2fsa.sherpa" app/proguard-rules.pro; then
+            {
+              echo ""
+              echo "# Offline neural voices (sherpa-onnx) - added by the build workflow"
+              echo "-keep class com.k2fsa.sherpa.onnx.** { *; }"
+              echo "-keepclasseswithmembernames class * { native <methods>; }"
+              echo "-dontwarn org.apache.commons.compress.**"
+              echo "-dontwarn org.tukaani.**"
+              echo "-dontwarn com.github.luben.**"
+              echo "-dontwarn org.brotli.**"
+              echo "-dontwarn org.objectweb.**"
+            } >> app/proguard-rules.pro
+          fi
+          ls -la app/src/main/jniLibs/arm64-v8a app/src/main/java/com/k2fsa/sherpa/onnx
+
       - name: Build APKs (debug + release)
         env:
           GIT_SHA: ${{ github.sha }}
