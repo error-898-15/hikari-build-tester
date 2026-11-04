@@ -248,24 +248,51 @@ jobs:
           if-no-files-found: error
 
       # ---- TEST CHANNELS: updated on every push to main ----
-      - name: Publish test APK to build branch
+      - name: Publish test APKs to build branch
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cp "app/build/outputs/apk/release/$APK_UNIVERSAL" hikari.apk
-          SIZE_MB=$(du -m hikari.apk | cut -f1)
-          if [ "$SIZE_MB" -ge 100 ]; then
-            echo "hikari.apk is ${SIZE_MB}MB - over GitHub's 100MB file limit, skipping build-branch push (the release APK is still in the artifacts)."
+          OUT=app/build/outputs/apk/release
+          PUB=/tmp/build-branch
+          rm -rf "$PUB" && mkdir -p "$PUB"
+          # GitHub refuses any single file of 100 MiB or more. The universal APK
+          # (both processors) can pass that limit, so each APK is checked on its
+          # own and only the ones that fit are put on the build branch. The
+          # smaller per-processor APKs always fit, so the branch never stays empty.
+          LIMIT=$((95 * 1024 * 1024))
+          COUNT=0
+          add_apk() {
+            SRC="$1"
+            DEST="$2"
+            if [ -z "$SRC" ] || [ ! -f "$OUT/$SRC" ]; then
+              return 0
+            fi
+            SIZE=$(stat -c%s "$OUT/$SRC")
+            if [ "$SIZE" -ge "$LIMIT" ]; then
+              echo "$DEST is $((SIZE / 1024 / 1024)) MB - over GitHub's 100 MB file limit, not put on the build branch (it is still in the artifacts and the continuous release)."
+              return 0
+            fi
+            cp "$OUT/$SRC" "$PUB/$DEST"
+            COUNT=$((COUNT + 1))
+          }
+          add_apk "$APK_UNIVERSAL" hikari.apk
+          add_apk "$APK_ARM64" hikari-arm64-v8a.apk
+          add_apk "$APK_ARM32" hikari-armeabi-v7a.apk
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No APK is small enough for the build branch - skipping (the release APKs are still in the artifacts)."
             exit 0
           fi
+          cd "$PUB"
+          git init -q
+          git checkout -q -b build
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin build >/dev/null 2>&1 && git checkout build 2>/dev/null || git checkout --orphan build
-          cp "app/build/outputs/apk/release/$APK_UNIVERSAL" hikari.apk
-          git add hikari.apk
-          git commit -m "build: update test APK $(date -u +%Y%m%d%H%M)" || true
-          git push origin build --force || { echo "build-branch push rejected (APK too large for GitHub's 100MB limit) - not fatal, release APK stays in artifacts."; exit 0; }
+          git add .
+          git commit -q -m "build: update test APKs $(date -u +%Y%m%d%H%M)"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin build --force || { echo "build-branch push was rejected - not fatal, the release APKs stay in the artifacts."; exit 0; }
+          ls -la "$PUB"
 
       - name: Publish test APK to continuous release
         if: github.ref == 'refs/heads/main'
