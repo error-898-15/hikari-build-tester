@@ -44,11 +44,19 @@ class GoogleTtsVoice(context: Context) : DubVoice {
 
             val bytes = java.io.ByteArrayOutputStream()
             for (piece in chunk(text, MAX_CHARS)) {
-                val url = "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob" +
-                    "&tl=" + URLEncoder.encode(lang, "UTF-8") +
-                    "&q=" + URLEncoder.encode(piece, "UTF-8")
-                val part = Http.getBytes(url, mapOf("Referer" to "https://translate.google.com/"))
-                if (part == null || part.size < 200) {
+                // Two public "clients" of the same endpoint: if one is refused, try the other.
+                var part: ByteArray? = null
+                for (client in CLIENTS) {
+                    val url = "https://translate.google.com/translate_tts?ie=UTF-8&client=" + client +
+                        "&tl=" + URLEncoder.encode(lang, "UTF-8") +
+                        "&q=" + URLEncoder.encode(piece, "UTF-8")
+                    val got = Http.getBytes(url, mapOf("Referer" to "https://translate.google.com/"))
+                    if (got != null && got.size >= 200) {
+                        part = got
+                        break
+                    }
+                }
+                if (part == null) {
                     // Rate-limited or blocked: back off 20s, then 40s, 80s … (max 5 min).
                     failStreak++
                     blockedUntil = System.currentTimeMillis() +
@@ -85,21 +93,13 @@ class GoogleTtsVoice(context: Context) : DubVoice {
         return parts.filter { it.isNotBlank() }
     }
 
-    /** Keeps the clip cache under ~60 MB, oldest first. */
-    private fun trimCache() {
-        val files = dir.listFiles() ?: return
-        var total = files.sumOf { it.length() }
-        if (total <= MAX_CACHE_BYTES) return
-        for (f in files.sortedBy { it.lastModified() }) {
-            total -= f.length()
-            f.delete()
-            if (total <= MAX_CACHE_BYTES * 3 / 4) break
-        }
-    }
+    /** Keeps the clip cache (raw + edited clips) under ~120 MB, oldest first. */
+    private fun trimCache() = DubCache.trim(dir, MAX_CACHE_BYTES)
 
     companion object {
         private const val MAX_CHARS = 180
-        private const val MAX_CACHE_BYTES = 60L * 1024 * 1024
+        private const val MAX_CACHE_BYTES = 120L * 1024 * 1024
+        private val CLIENTS = listOf("tw-ob", "gtx")
 
         internal fun key(kind: String, lang: String, text: String): String {
             val d = MessageDigest.getInstance("SHA-1").digest("$kind|$lang|$text".toByteArray())
