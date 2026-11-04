@@ -8,8 +8,15 @@ import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.CheckBox
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.Spinner
 import android.widget.TextView
+import android.widget.Toast
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.launch
 import com.hikari.app.data.Translator
 import com.hikari.app.i18n.I18n
 
@@ -134,6 +141,7 @@ object DubDialog {
             I18n.t("Automatic (Google, then phone voice)"),
             I18n.t("Google Translate voice (online)"),
             I18n.t("Phone voice (offline)"),
+            I18n.t("Neural voice - offline, best quality (Hindi, many actors)"),
         )
         root.addView(label(I18n.t("Voice")))
         val voiceSpinner = spinner(voiceNames, DubPrefs.mode(activity).ordinal)
@@ -173,9 +181,82 @@ object DubDialog {
                 val multi = smartBox.isChecked
                 DubPrefs.save(activity, lang, mode, duck)
                 DubPrefs.saveSmart(activity, multi)
-                onStart(lang, mode, duck, multi)
+                val isHindi = lang.substringBefore('-').equals("hi", ignoreCase = true)
+                when {
+                    mode != VoiceMode.NEURAL -> onStart(lang, mode, duck, multi)
+                    !isHindi -> {
+                        // The neural voice speaks Hindi only for now.
+                        Toast.makeText(
+                            activity,
+                            I18n.t("The neural voice is Hindi only for now, so the normal voice is used."),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        onStart(lang, VoiceMode.AUTO, duck, multi)
+                    }
+                    SherpaModels.isInstalled(activity) -> onStart(lang, mode, duck, multi)
+                    else -> NeuralDownload.show(activity) { ok ->
+                        if (ok) onStart(lang, mode, duck, multi)
+                    }
+                }
             }
         }
         builder.show()
+    }
+}
+
+/**
+ * First use of the neural voice: downloads the voice pack once (a few hundred
+ * MB, from GitHub) and shows the progress. [onDone] gets true when it is ready.
+ */
+internal object NeuralDownload {
+
+    fun show(activity: Activity, onDone: (Boolean) -> Unit) {
+        val d = activity.resources.displayMetrics.density
+        fun pad(v: Int) = (v * d).toInt()
+
+        val status = TextView(activity).apply {
+            textSize = 13f
+            text = I18n.t("Downloading the voice pack once (a few hundred MB). Keep this screen open and stay on Wi-Fi.")
+        }
+        val bar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            isIndeterminate = false
+            setPadding(0, pad(12), 0, 0)
+        }
+        val box = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad(20), pad(12), pad(20), pad(4))
+            addView(status)
+            addView(bar)
+        }
+
+        val scope = (activity as? LifecycleOwner)?.lifecycleScope ?: MainScope()
+        var job: Job? = null
+        val dlg = AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle(I18n.t("Neural voice (Hindi)"))
+            .setView(box)
+            .setCancelable(false)
+            .setNegativeButton(I18n.t("Cancel")) { _, _ -> job?.cancel() }
+            .create()
+        dlg.show()
+
+        val running = scope.launch {
+            val err = SherpaModels.install(activity.applicationContext) { pct, unpacking ->
+                activity.runOnUiThread {
+                    bar.progress = pct
+                    status.text = (if (unpacking) I18n.t("Unpacking") else I18n.t("Downloading")) + "… " + pct + "%"
+                }
+            }
+            runCatching { dlg.dismiss() }
+            if (err == null) {
+                Toast.makeText(activity, I18n.t("Neural voice is ready."), Toast.LENGTH_SHORT).show()
+                onDone(true)
+            } else {
+                Toast.makeText(activity, err, Toast.LENGTH_LONG).show()
+                onDone(false)
+            }
+        }
+        job = running
+        running.invokeOnCompletion { runCatching { activity.runOnUiThread { runCatching { dlg.dismiss() } } } }
     }
 }
