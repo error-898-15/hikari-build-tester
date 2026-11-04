@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -108,9 +109,14 @@
              available") and WebView simply skips the feature instead of dying.
              The number is the standard GMS version int; it only has to be a
              plausible integer, nothing else reads it. -->
+        <!-- Manga translation (ML Kit) pulls in play-services-basement, which declares
+             this same tag itself, so the two collide in the manifest merger. Ours
+             stays (it is what stops the WebView crash above) and wins; its value is
+             now the library's own, so the two can never disagree. -->
         <meta-data
             android:name="com.google.android.gms.version"
-            android:value="12451000" />
+            android:value="@integer/google_play_services_version"
+            tools:replace="android:value" />
 
         <!-- MainActivity has NO launcher intent-filter of its own: the launcher
              entry is one of the activity-aliases below, each carrying a
