@@ -135,9 +135,14 @@ class SherpaTtsVoice(context: Context) : DubVoice {
             service = null
             connected = CompletableDeferred()
             crashes++
-            if (crashes >= 2) broken = true
+            // Three ways of starting the voice exist (see [NeuralTtsService]); one
+            // death is allowed per way before the neural voice gives up for this dub.
+            if (crashes >= MAX_DEATHS) broken = true
             val step = lastStep()
             val tried = variant
+            // Only the requests that were waiting at THIS moment belong to the
+            // dead helper. A request sent after it restarted must not be failed.
+            val waitingIds = pending.keys.toList()
             // Android writes the reason a moment after the process ends.
             Handler(Looper.getMainLooper()).postDelayed({
                 val reason = exitReason()
@@ -149,9 +154,7 @@ class SherpaTtsVoice(context: Context) : DubVoice {
                 // This way of starting the voice did not survive: try the next
                 // one on the following attempt (unless it has worked before).
                 if (prefs.getInt("good_variant", -1) != tried) variant = (tried + 1) % 3
-                val waiting = pending.values.toList()
-                pending.clear()
-                waiting.forEach { it.complete("the voice helper stopped") }
+                waitingIds.forEach { id -> pending.remove(id)?.complete("the voice helper stopped") }
             }, 1_200L)
         }
 
@@ -297,6 +300,9 @@ class SherpaTtsVoice(context: Context) : DubVoice {
     }
 
     companion object {
+        /** How many times the helper may die in one dub (one per way of starting it). */
+        private const val MAX_DEATHS = 3
+
         /** Kokoro multi-lang v1.0 speaker ids: hf_alpha, hf_beta, hm_omega, hm_psi. */
         private val HI_WOMAN = intArrayOf(32, 31)
         private val HI_MAN = intArrayOf(34, 33)
