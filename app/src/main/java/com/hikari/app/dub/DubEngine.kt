@@ -18,6 +18,7 @@ import android.os.SystemClock
 import com.hikari.app.data.Logs
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
 enum class VoiceMode { AUTO, GOOGLE, LOCAL, NEURAL }
@@ -73,7 +74,7 @@ class DubEngine(
     private val ready = ConcurrentHashMap<Int, File>()
     private val inFlight = ConcurrentHashMap.newKeySet<Int>()
     private val failed = ConcurrentHashMap.newKeySet<Int>()
-    private var failureNoticeShown = false
+    private val failureNoticeShown = AtomicBoolean(false)
 
     private var clip: MediaPlayer? = null
     private var clipToken = 0
@@ -96,8 +97,15 @@ class DubEngine(
     private var liveWatch: Job? = null
     private var liveWorker: Job? = null
     private val liveQueue = java.util.ArrayDeque<LiveLine>()
-    private var neuralLoadingShown = false
-    private var neuralProblemShown = false
+    // Up to 3 lines are prepared at the same moment (see [gate]), and when the
+    // voice helper stops they all fail in the same instant. A plain Boolean let
+    // every one of them see "not shown yet" and each posted the same popup (the
+    // popup appeared 3 times). compareAndSet lets exactly one of them through.
+    private val neuralLoadingShown = AtomicBoolean(false)
+    private val neuralProblemShown = AtomicBoolean(false)
+    private val noticeLock = Any()
+    private var lastNoticeText: String? = null
+    private var lastNoticeAt = 0L
 
     /** One caption waiting to be voiced (live mode). */
     private class LiveLine(val cue: DubCue, val windowMs: Long, val at: Long)
@@ -127,8 +135,10 @@ class DubEngine(
         this.smart = multi
         this.liveMode = live
         neural.resetCast()
-        neuralLoadingShown = false
-        neuralProblemShown = false
+        neuralLoadingShown.set(false)
+        neuralProblemShown.set(false)
+        lastNoticeText = null
+        lastNoticeAt = 0L
         liveSeen = false
         liveQueue.clear()
         val neuralLikely = (mode == VoiceMode.NEURAL || mode == VoiceMode.AUTO) &&
@@ -137,7 +147,7 @@ class DubEngine(
         lookaheadMs = if (neuralLikely) NEURAL_LOOKAHEAD_MS else LOOKAHEAD_MS
         this.cast = if (smart && !live) CastDirector.assign(cues) else Cast(emptyList())
         activeLang = lang
-        failureNoticeShown = false
+        failureNoticeShown.set(false)
         spokenIdx = -1
         lastPos = effectivePos()
         loop = scope.launch(Dispatchers.Main) {
@@ -383,6 +393,8 @@ class DubEngine(
         val translated = Translator.translateTo(cue.text, lang).ifBlank { cue.text }
         val spoken = SubtitleCues.forSpeech(translated)
         if (spoken.isBlank()) return null
+        // A line with no letter or digit in it ("...", "♪", "-") has nothing to say.
+        if (spoken.none { it.isLetterOrDigit() }) return null
         // Which character speaks (and so which actor / pitch / speed).
         val profile = if (smart) cast.profileFor(cue) else CastDirector.NARRATOR
         val voices = when (mode) {
@@ -397,10 +409,9 @@ class DubEngine(
         for (v in voices) {
             if (!active) return null
             if (!v.isAvailable(lang)) continue
-            if (v === neural && !neural.isLoaded && !neuralLoadingShown) {
-                neuralLoadingShown = true
+            if (v === neural && !neural.isLoaded && neuralLoadingShown.compareAndSet(false, true)) {
                 withContext(Dispatchers.Main) {
-                    onStatus("Dub: loading the neural voice (the first time takes a little while)...")
+                    showNotice("Dub: loading the neural voice (the first time takes a little while)...")
                 }
             }
             raw = v.synthesize(spoken, lang, profile)
@@ -408,12 +419,11 @@ class DubEngine(
                 fromNeural = v === neural
                 break
             }
-            if (v === neural && !neuralProblemShown && active) {
-                neuralProblemShown = true
+            if (v === neural && active && neuralProblemShown.compareAndSet(false, true)) {
                 val why = neural.lastError ?: "unknown reason"
                 withContext(Dispatchers.Main) {
                     Logs.log("Dub", "Neural voice failed: $why")
-                    onStatus("Dub: the neural voice stopped, so the normal voice is used. Open Dub audio to see why.")
+                    showNotice("Dub: the neural voice stopped, so the normal voice is used. Open Dub audio to see why.")
                 }
             }
         }
@@ -440,11 +450,26 @@ class DubEngine(
         return (minOf(nextStart, cue.endMs + 700L) - cue.startMs).coerceAtLeast(600L)
     }
 
+    /**
+     * The one door the prepare-path popups go through. The same text is never
+     * shown twice within 20 seconds, so a burst of failures cannot repeat a
+     * popup. (The player also replaces a popup that is still on screen instead
+     * of queueing a new one behind it.)
+     */
+    private fun showNotice(text: String) {
+        synchronized(noticeLock) {
+            val now = SystemClock.elapsedRealtime()
+            if (text == lastNoticeText && now - lastNoticeAt < NOTICE_REPEAT_MS) return
+            lastNoticeText = text
+            lastNoticeAt = now
+        }
+        onStatus(text)
+    }
+
     private fun noticeFailureOnce() {
-        if (failureNoticeShown) return
-        failureNoticeShown = true
+        if (!failureNoticeShown.compareAndSet(false, true)) return
         scope.launch(Dispatchers.Main) {
-            onStatus(
+            showNotice(
                 when (mode) {
                     VoiceMode.LOCAL -> "This phone has no offline voice for that language. " +
                         "Install it in Settings → Text-to-speech, or pick the Google voice."
@@ -463,5 +488,6 @@ class DubEngine(
         private const val LIVE_STALE_MS = 15_000L
         private const val RETRY_AFTER_MS = 15_000L
         private const val MAX_SPEED = 1.6f
+        private const val NOTICE_REPEAT_MS = 20_000L
     }
 }
