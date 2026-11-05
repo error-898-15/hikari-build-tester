@@ -34,6 +34,13 @@ class SherpaTtsVoice(private val context: Context) : DubVoice {
     @Volatile private var tts: OfflineTts? = null
     @Volatile private var broken = false
 
+    /** Why the last attempt failed (shown to the person so we can fix it). */
+    @Volatile var lastError: String? = null
+        private set
+
+    /** True once the model is loaded in memory. */
+    val isLoaded: Boolean get() = tts != null
+
     // character -> actor, handed out in order of first appearance
     private val assigned = ConcurrentHashMap<String, Int>()
     private var maleCount = 0
@@ -56,26 +63,42 @@ class SherpaTtsVoice(private val context: Context) : DubVoice {
 
     override suspend fun synthesize(text: String, lang: String, profile: VoiceProfile): File? =
         withContext(Dispatchers.IO) {
+            // Be gentle: this runs for a long time and must not starve the
+            // video decoder. (The shared thread gets its old priority back.)
+            val old = android.os.Process.getThreadPriority(android.os.Process.myTid())
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            try {
+                synthesizeNow(text, lang, profile)
+            } finally {
+                android.os.Process.setThreadPriority(old)
+            }
+        }
+
+    private fun synthesizeNow(text: String, lang: String, profile: VoiceProfile): File? {
             val sid = actorFor(profile)
             val out = File(dir, GoogleTtsVoice.key("n1", lang, "$sid|$text") + ".wav")
-            if (out.exists() && out.length() > 0) return@withContext out
+            if (out.exists() && out.length() > 0) return out
 
-            val engine = engine() ?: return@withContext null
+            val engine = engine() ?: return null
             val audio = synchronized(lock) {
                 try {
                     engine.generate(text = text, sid = sid, speed = 1.0f)
                 } catch (t: Throwable) {
+                    lastError = "speaking failed: " + (t.message ?: t.javaClass.simpleName)
                     null
                 }
-            } ?: return@withContext null
+            } ?: return null
             val samples = audio.samples
-            if (samples.isEmpty()) return@withContext null
+            if (samples.isEmpty()) {
+                lastError = "the voice returned no sound"
+                return null
+            }
 
             val tmp = File(dir, out.name + ".part")
             writeWav(tmp, samples, audio.sampleRate)
             if (out.exists()) out.delete()
             if (tmp.renameTo(out)) out else null
-        }
+    }
 
     override fun release() {
         synchronized(lock) {
@@ -124,7 +147,7 @@ class SherpaTtsVoice(private val context: Context) : DubVoice {
                     lexicon = lexicons,
                     lang = "hi",
                 )
-                val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+                val threads = (Runtime.getRuntime().availableProcessors() - 2).coerceIn(1, 3)
                 val cfg = OfflineTtsConfig(
                     model = OfflineTtsModelConfig(
                         kokoro = kokoro,
@@ -136,6 +159,7 @@ class SherpaTtsVoice(private val context: Context) : DubVoice {
                 OfflineTts(config = cfg).also { tts = it }
             } catch (t: Throwable) {
                 broken = true
+                lastError = "could not start: " + t.javaClass.simpleName + " " + (t.message ?: "")
                 null
             }
         }
