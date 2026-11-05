@@ -170,6 +170,7 @@ class DubEngine(
         liveQueue.clear()
         liveText = null
         stopClip()
+        neural.unload()
         ready.clear()
         inFlight.clear()
         failed.clear()
@@ -390,6 +391,7 @@ class DubEngine(
         var raw: File? = null
         var fromNeural = false
         for (v in voices) {
+            if (!active) return null
             if (!v.isAvailable(lang)) continue
             if (v === neural && !neural.isLoaded && !neuralLoadingShown) {
                 neuralLoadingShown = true
@@ -402,7 +404,7 @@ class DubEngine(
                 fromNeural = v === neural
                 break
             }
-            if (v === neural && !neuralProblemShown) {
+            if (v === neural && !neuralProblemShown && active) {
                 neuralProblemShown = true
                 val why = neural.lastError ?: "unknown reason"
                 withContext(Dispatchers.Main) {
