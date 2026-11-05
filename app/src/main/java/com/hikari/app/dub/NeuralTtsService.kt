@@ -28,6 +28,9 @@ internal object NeuralIpc {
     const val K_SID = "sid"
     const val K_OUT = "out"
     const val K_LANG = "lang"
+    const val K_VARIANT = "variant"
+    /** Where the helper writes what it is doing, so that if it dies we know where. */
+    const val TRACE_FILE = "helper_trace.txt"
     const val K_OK = "ok"
     const val K_ERR = "err"
 }
@@ -48,6 +51,7 @@ class NeuralTtsService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        trace("service started")
         val t = HandlerThread("neural-tts", Process.THREAD_PRIORITY_BACKGROUND)
         t.start()
         thread = t
@@ -84,6 +88,7 @@ class NeuralTtsService : Service() {
             synth(data)
             answer.putBoolean(NeuralIpc.K_OK, true)
         } catch (t: Throwable) {
+            trace("error: " + t.javaClass.simpleName + " " + (t.message ?: ""))
             answer.putBoolean(NeuralIpc.K_OK, false)
             answer.putString(NeuralIpc.K_ERR, t.javaClass.simpleName + ": " + (t.message ?: ""))
         }
@@ -98,11 +103,14 @@ class NeuralTtsService : Service() {
         val sid = b.getInt(NeuralIpc.K_SID)
         val out = File(b.getString(NeuralIpc.K_OUT) ?: error("no output file"))
         val lang = b.getString(NeuralIpc.K_LANG) ?: "hi"
+        val variant = b.getInt(NeuralIpc.K_VARIANT)
 
-        val engine = engineFor(dir, lang)
+        val engine = engineFor(dir, lang, variant)
+        trace("speaking: actor " + sid + ", " + text.length + " characters")
         val audio = engine.generate(text = text, sid = sid, speed = 1.0f)
         val samples = audio.samples
         if (samples.isEmpty()) error("the voice returned no sound")
+        trace("done: " + samples.size + " samples")
 
         val tmp = File(out.path + ".part")
         writeWav(tmp, samples, audio.sampleRate)
@@ -110,8 +118,13 @@ class NeuralTtsService : Service() {
         if (!tmp.renameTo(out)) error("could not save the audio")
     }
 
-    private fun engineFor(d: File, lang: String): OfflineTts {
-        val key = d.path + "|" + lang
+    /**
+     * [variant] is a safety net: if one way of starting the voice makes the
+     * helper die, the player tries the next way on the following attempt.
+     *   0 = Hindi through espeak, 1 = default language setting, 2 = Hindi on one thread
+     */
+    private fun engineFor(d: File, lang: String, variant: Int): OfflineTts {
+        val key = d.path + "|" + lang + "|" + variant
         tts?.let { if (loadedFor == key) return it }
         try { tts?.release() } catch (e: Throwable) {}
         tts = null
@@ -127,9 +140,10 @@ class NeuralTtsService : Service() {
             tokens = File(d, "tokens.txt").path,
             dataDir = File(d, "espeak-ng-data").path,
             lexicon = lexicons,
-            lang = lang,
+            lang = if (variant == 1) "" else lang,
         )
-        val threads = (Runtime.getRuntime().availableProcessors() - 2).coerceIn(1, 3)
+        val threads = if (variant == 2) 1 else (Runtime.getRuntime().availableProcessors() - 2).coerceIn(1, 3)
+        trace("loading voice: " + model.name + " " + (model.length() / 1_000_000L) + " MB, way " + variant + ", threads " + threads)
         val cfg = OfflineTtsConfig(
             model = OfflineTtsModelConfig(
                 kokoro = kokoro,
@@ -139,9 +153,17 @@ class NeuralTtsService : Service() {
             ),
         )
         val created = OfflineTts(config = cfg)
+        trace("voice loaded, actors: " + created.numSpeakers())
         tts = created
         loadedFor = key
         return created
+    }
+
+    private fun trace(line: String) {
+        try {
+            val f = File(File(cacheDir, "dub").apply { mkdirs() }, NeuralIpc.TRACE_FILE)
+            f.appendText(line + "\n")
+        } catch (t: Throwable) {}
     }
 
     /** 16-bit mono WAV. */
