@@ -34,7 +34,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * off for this dub.
  *
  * Actors: three real Hindi speakers (Priyamvada = woman, Rohan and Pratham =
- * men). A character keeps the same actor for the whole video. Characters that
+ * men) for Hindi, and two English Kokoro speakers (Heart = woman, Michael =
+ * man) for English. A character keeps the same actor for the whole video. Characters that
  * have to share a speaker get a different speaking speed (done inside the
  * voice, so it stays clean) and a different pitch ([fxFor], applied by the
  * audio editor), so two characters never sound the same.
@@ -56,6 +57,9 @@ class SherpaTtsVoice(context: Context) : DubVoice {
     /** True once the voice has produced audio in this run. */
     @Volatile var isLoaded: Boolean = false
         private set
+
+    /** Language of the dub that is running (decides which actors are in the cast). */
+    @Volatile private var voiceLang = "hi"
 
     // character -> actor, handed out in order of first appearance (guarded by itself)
     private val assigned = HashMap<String, Actor>()
@@ -209,7 +213,7 @@ class SherpaTtsVoice(context: Context) : DubVoice {
     // ───────────────────────── DubVoice ─────────────────────────
 
     override suspend fun isAvailable(lang: String): Boolean =
-        !broken && supports(lang) && SherpaModels.isInstalled(app)
+        !broken && SherpaModels.isInstalledFor(app, lang)
 
     override suspend fun synthesize(text: String, lang: String): File? =
         synthesize(text, lang, CastDirector.NARRATOR)
@@ -222,6 +226,7 @@ class SherpaTtsVoice(context: Context) : DubVoice {
 
     override suspend fun synthesize(text: String, lang: String, profile: VoiceProfile): File? =
         withContext(Dispatchers.IO) {
+            voiceLang = lang
             val actor = try {
                 actorFor(profile)
             } catch (t: Throwable) {
@@ -239,10 +244,17 @@ class SherpaTtsVoice(context: Context) : DubVoice {
             pending[id] = answer
             val data = Bundle().apply {
                 putInt(NeuralIpc.K_ID, id)
-                putString(NeuralIpc.K_DIR, SherpaModels.voiceDir(app, actor.voice).path)
-                putString(NeuralIpc.K_DATA, SherpaModels.espeakDir(app).path)
+                if (actor.voice.kokoro) {
+                    putString(NeuralIpc.K_DIR, SherpaModels.kokoroDir(app).path)
+                    putString(NeuralIpc.K_DATA, SherpaModels.kokoroEspeakDir(app).path)
+                    putString(NeuralIpc.K_KIND, "kokoro")
+                } else {
+                    putString(NeuralIpc.K_DIR, SherpaModels.voiceDir(app, actor.voice).path)
+                    putString(NeuralIpc.K_DATA, SherpaModels.espeakDir(app).path)
+                    putString(NeuralIpc.K_KIND, "piper")
+                }
                 putString(NeuralIpc.K_TEXT, text)
-                putInt(NeuralIpc.K_SID, 0)
+                putInt(NeuralIpc.K_SID, actor.voice.sid)
                 putFloat(NeuralIpc.K_SPEED, actor.speed)
                 putString(NeuralIpc.K_OUT, out.path)
                 putInt(NeuralIpc.K_VARIANT, variant)
@@ -293,20 +305,19 @@ class SherpaTtsVoice(context: Context) : DubVoice {
 
     // ───────────────────────── actors ─────────────────────────
 
-    private fun supports(lang: String): Boolean =
-        lang.substringBefore('-').equals("hi", ignoreCase = true)
-
     /** Which voice, how fast it speaks, and how much the editor shifts its pitch. */
     private class Actor(val voice: PiperVoice, val speed: Float, val semitones: Float)
 
     /** Picks the actor for a character (same character = same actor all video). */
     private fun actorFor(p: VoiceProfile): Actor = synchronized(assigned) {
-        assigned.getOrPut(p.name + "|" + p.key) {
-            val ready = SherpaModels.readyVoices(app)
+        assigned.getOrPut(voiceLang + "|" + p.name + "|" + p.key) {
+            val ready = SherpaModels.readyVoicesFor(app, voiceLang)
             when {
                 ready.isEmpty() -> error("no voice installed")
                 p.name == "Narrator" -> pick(true, 0, ready)       // main / unnamed voice
-                p.name == "Voice B" -> pick(false, 0, ready)       // 2nd unnamed voice
+                p.name == "Voice B" -> pick(false, 0, ready)       // 2nd unnamed voice (man)
+                p.name == "Voice C" -> pick(true, 1, ready)        // new unnamed woman
+                p.name == "Voice D" -> pick(false, 1, ready)       // new unnamed man
                 p.gender == Gender.FEMALE -> pick(true, femaleCount++, ready)
                 p.gender == Gender.MALE -> pick(false, maleCount++, ready)
                 p.gender == Gender.CHILD -> {
