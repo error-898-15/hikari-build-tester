@@ -14,6 +14,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import android.os.SystemClock
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
@@ -87,7 +88,15 @@ class DubEngine(
     /** How far ahead lines are prepared; the neural voice is slower, so it starts earlier. */
     private var lookaheadMs = LOOKAHEAD_MS
     private var liveText: String? = null
-    private var liveToken = 0
+    private var liveSeen = false
+    private var liveWatch: Job? = null
+    private var liveWorker: Job? = null
+    private val liveQueue = java.util.ArrayDeque<LiveLine>()
+    private var neuralLoadingShown = false
+    private var neuralProblemShown = false
+
+    /** One caption waiting to be voiced (live mode). */
+    private class LiveLine(val cue: DubCue, val windowMs: Long, val at: Long)
 
     /**
      * [multi] = a different voice for every character.
@@ -114,6 +123,10 @@ class DubEngine(
         this.smart = multi
         this.liveMode = live
         neural.resetCast()
+        neuralLoadingShown = false
+        neuralProblemShown = false
+        liveSeen = false
+        liveQueue.clear()
         val neuralLikely = (mode == VoiceMode.NEURAL || mode == VoiceMode.AUTO) &&
             lang.substringBefore('-').equals("hi", ignoreCase = true) &&
             SherpaModels.isInstalled(context)
@@ -135,12 +148,26 @@ class DubEngine(
                 delay(TICK_MS)
             }
         }
+        if (live) {
+            liveWatch = scope.launch(Dispatchers.Main) {
+                delay(30_000L)
+                if (active && !liveSeen) {
+                    onStatus(
+                        "Dub: no captions arrived from this video in 30 seconds, so there is " +
+                            "nothing to read. Its built-in subtitle track may be empty. " +
+                            "Choose a subtitle with \"Load from internet\" and start dubbing again."
+                    )
+                }
+            }
+        }
     }
 
     fun stop() {
         loop?.cancel()
         loop = null
-        liveToken++
+        liveWatch?.cancel(); liveWatch = null
+        liveWorker?.cancel(); liveWorker = null
+        liveQueue.clear()
         liveText = null
         stopClip()
         ready.clear()
@@ -158,8 +185,9 @@ class DubEngine(
 
     /**
      * LIVE mode: the caption that is on screen right now (null / empty = none).
-     * A new line is cleaned, translated, voiced and played at once; a line that
-     * is already being read is not repeated. Main thread only.
+     * Every new line joins a short queue and is voiced one after another (a
+     * line is never thrown away just because the next caption appeared while
+     * it was still being prepared). Main thread only.
      */
     fun feedLive(text: String?) {
         if (!active || !liveMode) return
@@ -177,21 +205,43 @@ class DubEngine(
             smart,
         )
         if (parsed.isEmpty()) return
+        if (!liveSeen) {
+            liveSeen = true
+            onStatus("Dub: captions are arriving. The first line can take a few seconds to prepare.")
+        }
         val first = parsed.first()
         val body = parsed.joinToString(" ") { it.text }
         val windowMs = (body.length * 65L).coerceIn(1_200L, 6_000L)
         val cue = DubCue(0L, windowMs, body, first.speaker, first.turn, first.emotion)
 
-        val token = ++liveToken
-        scope.launch(Dispatchers.IO) {
-            val file = gate.withPermit {
-                if (token != liveToken || !active) null else prepareCue(cue, windowMs)
+        liveQueue.addLast(LiveLine(cue, windowMs, SystemClock.elapsedRealtime()))
+        while (liveQueue.size > 3) liveQueue.removeFirst()   // keep only the newest few
+        if (liveWorker?.isActive != true) {
+            liveWorker = scope.launch(Dispatchers.Main) { runLiveQueue() }
+        }
+    }
+
+    private suspend fun runLiveQueue() {
+        while (active && liveQueue.isNotEmpty()) {
+            val line = liveQueue.removeFirst()
+            if (SystemClock.elapsedRealtime() - line.at > LIVE_STALE_MS) continue
+            val file = withContext(Dispatchers.IO) {
+                gate.withPermit { prepareCue(line.cue, line.windowMs) }
             }
-            withContext(Dispatchers.Main) {
-                if (token != liveToken || !active) return@withContext
-                if (file != null) playClip(file, windowMs)
-                else noticeFailureOnce()
+            if (!active) return
+            if (file == null) {
+                noticeFailureOnce()
+                continue
             }
+            // Let the line that is speaking finish first (but not forever).
+            var waited = 0L
+            while (active && clip != null && waited < 8_000L) {
+                delay(100L)
+                waited += 100L
+            }
+            if (!active) return
+            if (SystemClock.elapsedRealtime() - line.at > LIVE_STALE_MS) continue
+            playClip(file, line.windowMs)
         }
     }
 
@@ -341,10 +391,23 @@ class DubEngine(
         var fromNeural = false
         for (v in voices) {
             if (!v.isAvailable(lang)) continue
+            if (v === neural && !neural.isLoaded && !neuralLoadingShown) {
+                neuralLoadingShown = true
+                withContext(Dispatchers.Main) {
+                    onStatus("Dub: loading the neural voice (the first time takes a little while)...")
+                }
+            }
             raw = v.synthesize(spoken, lang, profile)
             if (raw != null) {
                 fromNeural = v === neural
                 break
+            }
+            if (v === neural && !neuralProblemShown) {
+                neuralProblemShown = true
+                val why = neural.lastError ?: "unknown reason"
+                withContext(Dispatchers.Main) {
+                    onStatus("Dub: the neural voice failed ($why). Using the normal voice instead.")
+                }
             }
         }
         val rawClip = raw ?: return null
@@ -389,7 +452,8 @@ class DubEngine(
         private const val TICK_MS = 100L
         private const val PREFETCH_EVERY_MS = 700L
         private const val LOOKAHEAD_MS = 40_000L
-        private const val NEURAL_LOOKAHEAD_MS = 150_000L
+        private const val NEURAL_LOOKAHEAD_MS = 120_000L
+        private const val LIVE_STALE_MS = 15_000L
         private const val RETRY_AFTER_MS = 15_000L
         private const val MAX_SPEED = 1.6f
     }
