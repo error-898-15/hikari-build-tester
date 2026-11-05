@@ -12,6 +12,7 @@ import android.os.Messenger
 import android.os.Process
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
+import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
 import java.io.File
@@ -33,6 +34,8 @@ internal object NeuralIpc {
     const val K_SPEED = "speed"
     const val K_OUT = "out"
     const val K_VARIANT = "variant"
+    /** "kokoro" = the English Kokoro pack (several speakers in one model); anything else = a Piper voice. */
+    const val K_KIND = "kind"
     /** Where the helper writes what it is doing, so that if it dies we know where. */
     const val TRACE_FILE = "helper_trace.txt"
     const val K_OK = "ok"
@@ -124,8 +127,9 @@ class NeuralTtsService : Service() {
         val speed = b.getFloat(NeuralIpc.K_SPEED, 1.0f).coerceIn(0.6f, 1.6f)
         val out = File(b.getString(NeuralIpc.K_OUT) ?: error("no output file"))
         val variant = b.getInt(NeuralIpc.K_VARIANT)
+        val kokoro = b.getString(NeuralIpc.K_KIND) == "kokoro"
 
-        val engine = engineFor(dir, data, variant)
+        val engine = engineFor(dir, data, variant, kokoro)
         val started = System.nanoTime()
         trace("speaking: " + dir.name + ", " + text.length + " characters")
         val audio = engine.generate(text = text, sid = sid, speed = speed)
@@ -148,7 +152,7 @@ class NeuralTtsService : Service() {
      *   1 = 2 voices kept in memory, 2 threads
      *   2 = 1 voice kept in memory, 1 thread
      */
-    private fun engineFor(dir: File, data: File, variant: Int): OfflineTts {
+    private fun engineFor(dir: File, data: File, variant: Int, kokoro: Boolean): OfflineTts {
         val key = dir.path + "|" + variant
         engines[key]?.let { return it }
 
@@ -156,26 +160,51 @@ class NeuralTtsService : Service() {
         val cap = when (variant) { 0 -> 3; 1 -> 2; else -> 1 }
         trimEngines(cap - 1)
 
-        val model = File(dir, "model.onnx")
-        val vits = OfflineTtsVitsModelConfig(
-            model = model.path,
-            tokens = File(dir, "tokens.txt").path,
-            dataDir = data.path,
-        )
+        val model = if (kokoro) {
+            val int8 = File(dir, "model.int8.onnx")
+            if (int8.length() > 0) int8 else File(dir, "model.onnx")
+        } else {
+            File(dir, "model.onnx")
+        }
         val threads = when (variant) {
             0 -> (Runtime.getRuntime().availableProcessors() - 1).coerceIn(2, 3)
             1 -> 2
             else -> 1
         }
         trace("loading voice: " + dir.name + " " + (model.length() / 1_000_000L) + " MB, way " + variant + ", threads " + threads)
-        val cfg = OfflineTtsConfig(
-            model = OfflineTtsModelConfig(
-                vits = vits,
+        val modelCfg = if (kokoro) {
+            // English lexicon first, Chinese one after it (the pack is multi-language).
+            val lexicon = listOf("lexicon-us-en.txt", "lexicon-zh.txt")
+                .map { File(dir, it) }
+                .filter { it.length() > 0 }
+                .joinToString(",") { it.path }
+            val dict = File(dir, "dict")
+            OfflineTtsModelConfig(
+                kokoro = OfflineTtsKokoroModelConfig(
+                    model = model.path,
+                    voices = File(dir, "voices.bin").path,
+                    tokens = File(dir, "tokens.txt").path,
+                    dataDir = data.path,
+                    lexicon = lexicon,
+                    dictDir = if (dict.isDirectory) dict.path else "",
+                ),
                 numThreads = threads,
                 debug = false,
                 provider = "cpu",
-            ),
-        )
+            )
+        } else {
+            OfflineTtsModelConfig(
+                vits = OfflineTtsVitsModelConfig(
+                    model = model.path,
+                    tokens = File(dir, "tokens.txt").path,
+                    dataDir = data.path,
+                ),
+                numThreads = threads,
+                debug = false,
+                provider = "cpu",
+            )
+        }
+        val cfg = OfflineTtsConfig(model = modelCfg)
         val created = OfflineTts(config = cfg)
         trace("voice loaded: " + dir.name)
         engines[key] = created
