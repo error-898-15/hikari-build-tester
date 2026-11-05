@@ -40,9 +40,14 @@ enum class VoiceMode { AUTO, GOOGLE, LOCAL, NEURAL }
  * passed is dropped instead of being made (that waste is what used to make
  * the dub fall behind and then go silent).
  *
- * The original soundtrack is lowered ("ducked") while a clip speaks and
- * restored afterwards. A clip longer than its cue is sped up (max
- * [MAX_SPEED]x) so the voice does not run into the next line.
+ * While a line is dubbed, the ORIGINAL DIALOGUE is taken out of the movie's
+ * sound but the music and the sound effects keep playing: the audio stage of
+ * the player ([VoiceCutProcessor]) removes the centre of the stereo picture
+ * (or the centre channel of a 5.1 mix) for exactly the time the subtitle line
+ * is on screen. Mono sound cannot be separated, so there (and only there)
+ * the whole original sound is lowered ("ducked") instead, as before.
+ * A clip longer than its cue is sped up (max [MAX_SPEED]x) so the voice does
+ * not run into the next line.
  *
  * All public methods must be called from the main thread.
  */
@@ -68,6 +73,10 @@ class DubEngine(
     private var lang = "en"
     private var mode = VoiceMode.AUTO
     private var duck = 0.15f
+    /** How much of the original dialogue is removed while the dub speaks (0..1). */
+    private var cutAmount = 0.9f
+    /** Live mode: the dialogue stays removed until this moment (elapsedRealtime). */
+    private var liveHoldUntil = 0L
 
     /** True = every character gets its own voice and the clips are edited
      *  (pitch, speed, loudness). False = the plain voice, as before. */
@@ -141,6 +150,9 @@ class DubEngine(
         this.lang = lang
         this.mode = mode
         this.duck = duckVolume.coerceIn(0f, 1f)
+        // "Silent" removes 97% of the dialogue, "Quiet" 88%, "Medium" 76%.
+        this.cutAmount = (0.97f - this.duck * 0.6f).coerceIn(0.5f, 0.97f)
+        liveHoldUntil = 0L
         this.smart = multi
         this.liveMode = live
         neural.resetCast()
@@ -201,6 +213,7 @@ class DubEngine(
         liveQueue.clear()
         liveText = null
         stopClip()
+        restoreOriginal()
         neural.unload()
         ready.clear()
         inFlight.clear()
@@ -303,6 +316,9 @@ class DubEngine(
         }
         if (!isPlaying()) return
 
+        // Take the original dialogue out (or, for mono sound, lower it).
+        updateOriginal(pos)
+
         val idx = cueIndexAt(pos)
         if (idx < 0 || idx == spokenIdx) return
         val cue = cues[idx]
@@ -356,8 +372,7 @@ class DubEngine(
                     val rate = (clipMs.toFloat() / windowMs).coerceIn(1f, MAX_SPEED)
                     runCatching { p.playbackParams = PlaybackParams().setSpeed(rate) }
                 }
-                setOriginalVolume(duck)
-                ducked = true
+                liveHoldUntil = SystemClock.elapsedRealtime() + windowMs + 250L
                 clipStarted = true
                 if (isPlaying()) p.start()
             }
@@ -374,6 +389,64 @@ class DubEngine(
         clip?.let { runCatching { it.stop() }; runCatching { it.release() } }
         clip = null
         clipStarted = false
+    }
+
+    // ───────────────────────── original dialogue ─────────────────────────
+
+    /**
+     * Decides, every tick, what happens to the original sound.
+     *
+     * Normal case (stereo / 5.1): the dialogue is cut out for the time the
+     * subtitle line is heard, starting a little EARLY ([CUT_LEAD_MS]) because
+     * the audio stage works a fraction of a second ahead of what is heard.
+     * The music and the effects are not touched.
+     *
+     * Mono sound: nothing can be separated, so the whole sound is lowered
+     * for the time the dub clip speaks (never fully silent, see [MONO_FLOOR]).
+     */
+    private fun updateOriginal(pos: Long) {
+        if (DubVoiceCut.works) {
+            DubVoiceCut.target = if (covered(pos, CUT_LEAD_MS)) cutAmount else 0f
+            if (ducked) {                         // the sound became separable: undo the lowering
+                ducked = false
+                setOriginalVolume(1f)
+            }
+        } else {
+            DubVoiceCut.target = 0f
+            val want = covered(pos, 0L)
+            if (want && !ducked) {
+                ducked = true
+                setOriginalVolume(duck.coerceAtLeast(MONO_FLOOR))
+            } else if (!want && ducked) {
+                ducked = false
+                setOriginalVolume(1f)
+            }
+        }
+    }
+
+    /**
+     * True when the original dialogue at [pos] + [lead] must be silenced because
+     * the dub speaks (or is about to speak) that line. A line that has no dub
+     * (not ready yet, failed, only music) keeps its original voice, so there is
+     * never a silent hole.
+     */
+    private fun covered(pos: Long, lead: Long): Boolean {
+        if (!active) return false
+        if (liveMode) {
+            return (clip != null && clipStarted) || SystemClock.elapsedRealtime() < liveHoldUntil
+        }
+        val ahead = pos + lead
+        val idx = cueIndexAt(ahead)
+        if (idx < 0) return false
+        val c = cues[idx]
+        if (ahead > c.endMs + CUT_TAIL_MS) return false
+        if (idx == spokenIdx) return true
+        return ready.containsKey(idx) && pos < c.endMs - 300L
+    }
+
+    /** Gives the original sound back completely. */
+    private fun restoreOriginal() {
+        DubVoiceCut.target = 0f
         if (ducked) {
             ducked = false
             setOriginalVolume(1f)
@@ -508,13 +581,21 @@ class DubEngine(
         // Give the line its character's voice. Any problem => the plain clip.
         // The neural voice says by itself how much pitch change its actor needs.
         val fx = if (fromNeural) neural.fxFor(profile) else profile
+        val question = isQuestion(spoken)
         val name = GoogleTtsVoice.key(
             "fx", lang,
-            rawClip.name + "|" + fx.key + "|" + cue.emotion.name + "|" + (fitMs / 100L) + "|" + fromNeural,
+            rawClip.name + "|" + fx.key + "|" + cue.emotion.name + "|" + question + "|e3|" +
+                (fitMs / 100L) + "|" + fromNeural,
         ) + ".wav"
         val out = File(dir, name)
         if (out.exists() && out.length() > 0) return out
-        return if (DubFx.process(rawClip, out, fx, cue.emotion, fitMs)) out else rawClip
+        return if (DubFx.process(rawClip, out, fx, cue.emotion, fitMs, question)) out else rawClip
+    }
+
+    /** A spoken line that ends with a question mark (the voice rises at the end). */
+    private fun isQuestion(s: String): Boolean {
+        val t = s.trimEnd('"', '\'', '\u201D', '\u2019', ')', ' ')
+        return t.endsWith("?") || t.endsWith("\uFF1F") || t.endsWith("\u061F")
     }
 
     /** The translator gives the text back unchanged when it fails. */
@@ -562,5 +643,11 @@ class DubEngine(
         private const val LIVE_STALE_MS = 15_000L
         private const val RETRY_AFTER_MS = 15_000L
         private const val MAX_SPEED = 1.6f
+        /** The audio stage runs this far ahead of what is heard: cut the dialogue that much earlier. */
+        private const val CUT_LEAD_MS = 500L
+        /** Keep the dialogue cut a little after the subtitle line ends. */
+        private const val CUT_TAIL_MS = 250L
+        /** Mono sound: the original is never lowered below this (so effects and music stay faintly audible). */
+        private const val MONO_FLOOR = 0.10f
     }
 }
