@@ -206,7 +206,7 @@ object DubDialog {
 }
 
 /**
- * First use of the neural voice: downloads the voice pack once (a few hundred
+ * First use of the neural voice: downloads the voice pack once (about 130
  * MB, from GitHub) and shows the progress. [onDone] gets true when it is ready.
  */
 internal object NeuralDownload {
@@ -217,7 +217,7 @@ internal object NeuralDownload {
 
         val status = TextView(activity).apply {
             textSize = 13f
-            text = I18n.t("Downloading the voice pack once (a few hundred MB). Keep this screen open and stay on Wi-Fi.")
+            text = I18n.t("Downloading the voice pack once (about 130 MB). Keep this screen open and stay on Wi-Fi.")
         }
         val bar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
