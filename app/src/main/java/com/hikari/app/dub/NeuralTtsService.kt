@@ -1,6 +1,7 @@
 package com.hikari.app.dub
 
 import android.app.Service
+import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
@@ -11,8 +12,8 @@ import android.os.Messenger
 import android.os.Process
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
-import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
+import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
@@ -23,11 +24,14 @@ internal object NeuralIpc {
     const val MSG_SYNTH = 1
     const val MSG_RESULT = 2
     const val K_ID = "id"
+    /** Folder of the voice to use (model.onnx + tokens.txt). */
     const val K_DIR = "dir"
+    /** Folder with the espeak-ng data (shared by all voices). */
+    const val K_DATA = "data"
     const val K_TEXT = "text"
     const val K_SID = "sid"
+    const val K_SPEED = "speed"
     const val K_OUT = "out"
-    const val K_LANG = "lang"
     const val K_VARIANT = "variant"
     /** Where the helper writes what it is doing, so that if it dies we know where. */
     const val TRACE_FILE = "helper_trace.txt"
@@ -46,8 +50,8 @@ class NeuralTtsService : Service() {
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
     private var messenger: Messenger? = null
-    private var tts: OfflineTts? = null
-    private var loadedFor: String? = null
+    /** Voices that are loaded right now, least recently used first. */
+    private val engines = LinkedHashMap<String, OfflineTts>(4, 0.75f, true)
 
     override fun onCreate() {
         super.onCreate()
@@ -70,12 +74,27 @@ class NeuralTtsService : Service() {
         val h = handler
         if (t != null && h != null) {
             h.post {
-                try { tts?.release() } catch (e: Throwable) {}
-                tts = null
+                trimEngines(0)
                 t.quitSafely()
             }
         }
         super.onDestroy()
+    }
+
+    /** The phone is short of memory: keep only the voice that spoke last. */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            handler?.post { trimEngines(1) }
+        }
+    }
+
+    private fun trimEngines(keep: Int) {
+        while (engines.size > keep) {
+            val key = engines.keys.first()
+            val e = engines.remove(key)
+            try { e?.release() } catch (t: Throwable) {}
+        }
     }
 
     private fun handle(msg: Message) {
@@ -98,20 +117,23 @@ class NeuralTtsService : Service() {
     }
 
     private fun synth(b: Bundle) {
-        val dir = File(b.getString(NeuralIpc.K_DIR) ?: error("no model folder"))
+        val dir = File(b.getString(NeuralIpc.K_DIR) ?: error("no voice folder"))
+        val data = File(b.getString(NeuralIpc.K_DATA) ?: error("no language data folder"))
         val text = b.getString(NeuralIpc.K_TEXT) ?: error("no text")
         val sid = b.getInt(NeuralIpc.K_SID)
+        val speed = b.getFloat(NeuralIpc.K_SPEED, 1.0f).coerceIn(0.6f, 1.6f)
         val out = File(b.getString(NeuralIpc.K_OUT) ?: error("no output file"))
-        val lang = b.getString(NeuralIpc.K_LANG) ?: "hi"
         val variant = b.getInt(NeuralIpc.K_VARIANT)
 
-        if (text.none { it.isLetterOrDigit() }) error("nothing to say in this line")
-        val engine = engineFor(dir, lang, variant)
-        trace("speaking: actor " + sid + ", " + text.length + " characters")
-        val audio = engine.generate(text = text, sid = sid, speed = 1.0f)
+        val engine = engineFor(dir, data, variant)
+        val started = System.nanoTime()
+        trace("speaking: " + dir.name + ", " + text.length + " characters")
+        val audio = engine.generate(text = text, sid = sid, speed = speed)
         val samples = audio.samples
         if (samples.isEmpty()) error("the voice returned no sound")
-        trace("done: " + samples.size + " samples")
+        val tookMs = (System.nanoTime() - started) / 1_000_000L
+        val audioMs = samples.size * 1000L / audio.sampleRate.coerceAtLeast(1)
+        trace("done: " + audioMs + " ms of sound made in " + tookMs + " ms")
 
         val tmp = File(out.path + ".part")
         writeWav(tmp, samples, audio.sampleRate)
@@ -122,70 +144,43 @@ class NeuralTtsService : Service() {
     /**
      * [variant] is a safety net: if one way of starting the voice makes the
      * helper die, the player tries the next way on the following attempt.
-     *   0 = Hindi through espeak, 1 = default language setting, 2 = Hindi on one thread
+     *   0 = 3 voices kept in memory, up to 3 threads
+     *   1 = 2 voices kept in memory, 2 threads
+     *   2 = 1 voice kept in memory, 1 thread
      */
-    private fun engineFor(d: File, lang: String, variant: Int): OfflineTts {
-        val key = d.path + "|" + lang + "|" + variant
-        tts?.let { if (loadedFor == key) return it }
-        try { tts?.release() } catch (e: Throwable) {}
-        tts = null
+    private fun engineFor(dir: File, data: File, variant: Int): OfflineTts {
+        val key = dir.path + "|" + variant
+        engines[key]?.let { return it }
 
-        val model = File(d, "model.int8.onnx").takeIf { it.length() > 0 } ?: File(d, "model.onnx")
-        val lexicons = listOf("lexicon-us-en.txt", "lexicon-zh.txt")
-            .map { File(d, it) }
-            .filter { it.exists() }
-            .joinToString(",") { it.path }
-        val kokoro = OfflineTtsKokoroModelConfig(
+        // make room (a loaded voice costs about 100-150 MB)
+        val cap = when (variant) { 0 -> 3; 1 -> 2; else -> 1 }
+        trimEngines(cap - 1)
+
+        val model = File(dir, "model.onnx")
+        val vits = OfflineTtsVitsModelConfig(
             model = model.path,
-            voices = File(d, "voices.bin").path,
-            tokens = File(d, "tokens.txt").path,
-            dataDir = File(d, "espeak-ng-data").path,
-            lexicon = lexicons,
-            lang = if (variant == 1) "" else lang,
+            tokens = File(dir, "tokens.txt").path,
+            dataDir = data.path,
         )
-        // The multi-language Kokoro pack splits Chinese words with a dictionary
-        // (the "dict" folder of the pack). sherpa-onnx opens it while the voice
-        // starts, and if it is not told where the folder is it tries to open
-        // "/jieba.dict.utf8", which does not exist: that is a hard native abort
-        // (no Java error), the whole helper process dies, and the player only
-        // sees "the voice helper stopped". The official sherpa-onnx Android app
-        // passes this folder, so it is set here too.
-        //
-        // It is set through reflection on purpose: Tts.kt is downloaded by the
-        // build workflow (it is not kept in this repository), so the build must
-        // compile with whichever version it fetched. If that version has no
-        // such setting, nothing happens and the build is not affected.
-        val dictDir = File(d, "dict")
-        val dictSet = if (dictDir.isDirectory) setStringField(kokoro, "DictDir", dictDir.path) else false
-        trace("dict folder: " + (if (!dictDir.isDirectory) "not in the voice pack" else if (dictSet) "set" else "this sherpa-onnx has no such setting"))
-
-        // Fewer threads = less memory (each one holds its own working buffers),
-        // and a phone that is also playing a video has little to spare.
-        val threads = if (variant == 2) 1 else (Runtime.getRuntime().availableProcessors() - 2).coerceIn(1, 2)
-        trace("loading voice: " + model.name + " " + (model.length() / 1_000_000L) + " MB, way " + variant + ", threads " + threads)
+        val threads = when (variant) {
+            0 -> (Runtime.getRuntime().availableProcessors() - 1).coerceIn(2, 3)
+            1 -> 2
+            else -> 1
+        }
+        trace("loading voice: " + dir.name + " " + (model.length() / 1_000_000L) + " MB, way " + variant + ", threads " + threads)
         val cfg = OfflineTtsConfig(
             model = OfflineTtsModelConfig(
-                kokoro = kokoro,
+                vits = vits,
                 numThreads = threads,
                 debug = false,
                 provider = "cpu",
             ),
         )
         val created = OfflineTts(config = cfg)
-        trace("voice loaded, actors: " + created.numSpeakers())
-        tts = created
-        loadedFor = key
+        trace("voice loaded: " + dir.name)
+        engines[key] = created
         return created
     }
-
-    /** Calls `set<Name>(value)` on [target] when that setting exists. Never throws. */
-    private fun setStringField(target: Any, name: String, value: String): Boolean =
-        try {
-            target.javaClass.getMethod("set$name", String::class.java).invoke(target, value)
-            true
-        } catch (t: Throwable) {
-            false
-        }
 
     private fun trace(line: String) {
         try {
