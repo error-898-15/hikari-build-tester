@@ -120,7 +120,7 @@ object DubDialog {
                 val cues = SubtitleCues.parse(rawText)
                 val desc = CastDirector.assign(cues).describe()
                 if (desc.isBlank()) {
-                    I18n.t("No character names found in this subtitle. Lines use the main voice; two-person exchanges (- Hi / - Hello) get a man and a woman voice.")
+                    I18n.t("No character names found in this subtitle. Each new speaker turn gets a man or a woman voice at random; two-person exchanges (- Hi / - Hello) always get one of each.")
                 } else {
                     I18n.t("Characters found") + ": " + desc
                 }
@@ -149,7 +149,7 @@ object DubDialog {
             I18n.t("Automatic (Google, then phone voice)"),
             I18n.t("Google Translate voice (online)"),
             I18n.t("Phone voice (offline)"),
-            I18n.t("Neural voice - offline, fast, 3 real actors (Hindi)"),
+            I18n.t("Neural voice - offline, real actors (Hindi: 3 voices, English: 2 voices)"),
         )
         root.addView(label(I18n.t("Voice")))
         val voiceSpinner = spinner(voiceNames, DubPrefs.mode(activity).ordinal)
@@ -190,19 +190,20 @@ object DubDialog {
                 DubPrefs.save(activity, lang, mode, duck)
                 DubPrefs.saveSmart(activity, multi)
                 val isHindi = lang.substringBefore('-').equals("hi", ignoreCase = true)
+                val isEnglish = lang.substringBefore('-').equals("en", ignoreCase = true)
                 when {
                     mode != VoiceMode.NEURAL -> onStart(lang, mode, duck, multi)
-                    !isHindi -> {
-                        // The neural voice speaks Hindi only for now.
+                    !isHindi && !isEnglish -> {
+                        // The neural voices speak Hindi and English only for now.
                         Toast.makeText(
                             activity,
-                            I18n.t("The neural voice is Hindi only for now, so the normal voice is used."),
+                            I18n.t("The neural voice is Hindi and English only for now, so the normal voice is used."),
                             Toast.LENGTH_LONG,
                         ).show()
                         onStart(lang, VoiceMode.AUTO, duck, multi)
                     }
-                    SherpaModels.isInstalled(activity) -> onStart(lang, mode, duck, multi)
-                    else -> NeuralDownload.show(activity) { ok ->
+                    SherpaModels.isInstalledFor(activity, lang) -> onStart(lang, mode, duck, multi)
+                    else -> NeuralDownload.show(activity, isEnglish) { ok ->
                         if (ok) onStart(lang, mode, duck, multi)
                     }
                 }
@@ -213,18 +214,23 @@ object DubDialog {
 }
 
 /**
- * First use of the neural voice: downloads the three voices once (about 190
- * MB, from GitHub) and shows the progress. [onDone] gets true when it is ready.
+ * First use of the neural voice: downloads the voices once (Hindi: three
+ * voices, about 190 MB; English: two voices, about 130 MB, from GitHub) and
+ * shows the progress. [onDone] gets true when it is ready.
  */
 internal object NeuralDownload {
 
-    fun show(activity: Activity, onDone: (Boolean) -> Unit) {
+    fun show(activity: Activity, english: Boolean, onDone: (Boolean) -> Unit) {
         val d = activity.resources.displayMetrics.density
         fun pad(v: Int) = (v * d).toInt()
 
         val status = TextView(activity).apply {
             textSize = 13f
-            text = I18n.t("Downloading the voices once (3 voices, about 190 MB). Keep this screen open and stay on Wi-Fi.")
+            text = if (english) {
+                I18n.t("Downloading the English voices once (2 voices, about 130 MB). Keep this screen open and stay on Wi-Fi.")
+            } else {
+                I18n.t("Downloading the voices once (3 voices, about 190 MB). Keep this screen open and stay on Wi-Fi.")
+            }
         }
         val bar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
@@ -241,7 +247,7 @@ internal object NeuralDownload {
         val scope = (activity as? LifecycleOwner)?.lifecycleScope ?: MainScope()
         var job: Job? = null
         val dlg = AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle(I18n.t("Neural voice (Hindi)"))
+            .setTitle(if (english) I18n.t("Neural voice (English)") else I18n.t("Neural voice (Hindi)"))
             .setView(box)
             .setCancelable(false)
             .setNegativeButton(I18n.t("Cancel")) { _, _ -> job?.cancel() }
@@ -252,11 +258,16 @@ internal object NeuralDownload {
         dlg.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val running = scope.launch {
-            val err = SherpaModels.install(activity.applicationContext) { pct, unpacking ->
+            val progress: (Int, Boolean) -> Unit = { pct, unpacking ->
                 activity.runOnUiThread {
                     bar.progress = pct
                     status.text = (if (unpacking) I18n.t("Unpacking") else I18n.t("Downloading")) + "… " + pct + "%"
                 }
+            }
+            val err = if (english) {
+                SherpaModels.installKokoro(activity.applicationContext, progress)
+            } else {
+                SherpaModels.install(activity.applicationContext, progress)
             }
             runCatching { dlg.dismiss() }
             if (err == null) {
