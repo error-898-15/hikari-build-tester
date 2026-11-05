@@ -125,6 +125,36 @@ jobs:
               echo "-dontwarn org.objectweb.**"
             } >> app/proguard-rules.pro
           fi
+          # The neural voice runs in its own helper process, so a crash or
+          # out-of-memory in the voice can never close the player. That needs
+          # one service line in the manifest, and the helper process must skip
+          # the normal app start-up (it is only a voice).
+          python3 - <<'PY'
+          import sys
+          p = "app/src/main/AndroidManifest.xml"
+          s = open(p, encoding="utf-8").read()
+          if "NeuralTtsService" not in s:
+              i = s.rfind("</application>")
+              if i < 0:
+                  sys.exit("::error::no </application> in AndroidManifest.xml")
+              svc = ('    <service\n'
+                     '            android:name="com.hikari.app.dub.NeuralTtsService"\n'
+                     '            android:process=":neuraltts"\n'
+                     '            android:exported="false" />\n    ')
+              s = s[:i] + svc + s[i:]
+              open(p, "w", encoding="utf-8").write(s)
+          p = "app/src/main/java/com/hikari/app/HikariApp.kt"
+          s = open(p, encoding="utf-8").read()
+          if ":neuraltts" not in s:
+              old = "    override fun onCreate() {\n        super.onCreate()\n"
+              if old not in s:
+                  sys.exit("::error::HikariApp.onCreate not found")
+              add = ("        // The offline-voice helper process (NeuralTtsService) needs none of the app start-up.\n"
+                     "        if (runCatching { java.io.File(\"/proc/self/cmdline\").readText().trim('\\u0000').endsWith(\":neuraltts\") }.getOrDefault(false)) return\n")
+              s = s.replace(old, old + add, 1)
+              open(p, "w", encoding="utf-8").write(s)
+          PY
+          grep -n "neuraltts" app/src/main/AndroidManifest.xml app/src/main/java/com/hikari/app/HikariApp.kt
           ls -la app/src/main/jniLibs/arm64-v8a app/src/main/java/com/k2fsa/sherpa/onnx
 
       - name: Build APKs (debug + release)
