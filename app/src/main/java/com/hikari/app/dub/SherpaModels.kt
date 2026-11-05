@@ -15,136 +15,253 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
+/** One offline Hindi voice (a Piper model run by sherpa-onnx). */
+data class PiperVoice(val id: String, val gender: Gender, val label: String)
+
 /**
- * The offline neural voice model (Kokoro, 82M, many speakers incl. 4 Hindi
- * ones). It is NOT inside the APK (it is a few hundred MB): the person taps
- * "Start dubbing" with the neural voice and it is downloaded once, from the
- * official sherpa-onnx releases page on GitHub, and unpacked into the app's
- * private files folder.
+ * The offline neural voices (Piper, run through sherpa-onnx): three real,
+ * different Hindi speakers. Piper is MUCH faster than the Kokoro pack that
+ * used to be here (a line is made in a fraction of the time it takes to say
+ * it), which is what lets a whole video be voiced in a minute or two.
+ *
+ * Nothing is inside the APK. The first time, [install] downloads the three
+ * voices (about 60 MB each) from the official sherpa-onnx releases page on
+ * GitHub, once, and unpacks them into the app's private folder:
+ *
+ *   dub_models/piper-hi/espeak-ng-data/          (shared by all voices)
+ *   dub_models/piper-hi/voices/<id>/model.onnx + tokens.txt
+ *
+ * The first two voices are required; the third one is a bonus (if it cannot
+ * be downloaded the dub simply has one actor fewer).
  */
 object SherpaModels {
 
-    const val NAME = "kokoro-int8-multi-lang-v1_0"
-    private const val URL_TAR =
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_0.tar.bz2"
+    private const val BASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
+    private const val ESPEAK_URL = BASE + "espeak-ng-data.tar.bz2"
 
-    fun dir(c: Context): File = File(File(c.filesDir, "dub_models"), NAME)
+    /** Order matters: 1 woman, 1 man (required), then a second man (bonus). */
+    val VOICES: List<PiperVoice> = listOf(
+        PiperVoice("vits-piper-hi_IN-priyamvada-medium", Gender.FEMALE, "Priyamvada"),
+        PiperVoice("vits-piper-hi_IN-rohan-medium", Gender.MALE, "Rohan"),
+        PiperVoice("vits-piper-hi_IN-pratham-medium", Gender.MALE, "Pratham"),
+    )
+    private const val REQUIRED = 2
 
-    fun isInstalled(c: Context): Boolean {
-        val d = dir(c)
+    private fun root(c: Context): File = File(File(c.filesDir, "dub_models"), "piper-hi")
+
+    /** Folder with the espeak-ng data (shared by every voice). */
+    fun espeakDir(c: Context): File = File(root(c), "espeak-ng-data")
+
+    fun voiceDir(c: Context, v: PiperVoice): File = File(File(root(c), "voices"), v.id)
+
+    private fun espeakReady(c: Context): Boolean =
+        File(espeakDir(c), ".ok").exists() && File(espeakDir(c), "phontab").exists()
+
+    fun isVoiceReady(c: Context, v: PiperVoice): Boolean {
+        val d = voiceDir(c, v)
         return File(d, ".ok").exists() &&
-            (File(d, "model.int8.onnx").length() > 0 || File(d, "model.onnx").length() > 0) &&
-            File(d, "voices.bin").length() > 0 &&
-            File(d, "tokens.txt").length() > 0 &&
-            File(d, "espeak-ng-data").isDirectory
+            File(d, "model.onnx").length() > 0 &&
+            File(d, "tokens.txt").length() > 0
     }
 
+    /** The voices that are on the phone and usable right now. */
+    fun readyVoices(c: Context): List<PiperVoice> = VOICES.filter { isVoiceReady(c, it) }
+
+    fun isInstalled(c: Context): Boolean = espeakReady(c) && readyVoices(c).size >= REQUIRED
+
     fun delete(c: Context) {
-        dir(c).deleteRecursively()
+        root(c).deleteRecursively()
     }
 
     /**
-     * Downloads (resuming a half-finished download) and unpacks the model.
-     * [onProgress] gets (percent 0..100, unpacking?) from a background thread.
-     * Returns null on success, otherwise a short message for the person.
-     *
-     * A fully downloaded file is remembered (".done" marker), so if the app is
-     * closed or killed while unpacking, the next try goes straight to
-     * unpacking instead of asking the server for bytes past the end of the
-     * file (that is what used to end in "server answered 416").
+     * Downloads (resuming a half-finished download) and unpacks the voices.
+     * [onProgress] gets (percent 0..100 of the WHOLE job, unpacking?) from a
+     * background thread. Returns null on success, otherwise a short message.
      */
     suspend fun install(c: Context, onProgress: (Int, Boolean) -> Unit): String? =
         withContext(Dispatchers.IO) {
-            val root = File(c.filesDir, "dub_models").apply { mkdirs() }
-            val part = File(c.cacheDir, "$NAME.tar.bz2.part")
-            val marker = File(c.cacheDir, "$NAME.tar.bz2.done")
-            val staging = File(root, "$NAME.tmp")
-            var unpacking = false
-            // The first version of the neural voice used a bigger pack
-            // (about 330 MB). Free that space: it is not used any more.
+            val base = root(c).apply { mkdirs() }
+            // The first neural voice (Kokoro, 130-330 MB) is not used any more: free the space.
             runCatching {
-                File(root, "kokoro-multi-lang-v1_0").deleteRecursively()
-                File(c.cacheDir, "kokoro-multi-lang-v1_0.tar.bz2.part").delete()
-                File(c.cacheDir, "kokoro-multi-lang-v1_0.tar.bz2.done").delete()
+                val models = File(c.filesDir, "dub_models")
+                File(models, "kokoro-int8-multi-lang-v1_0").deleteRecursively()
+                File(models, "kokoro-int8-multi-lang-v1_0.tmp").deleteRecursively()
+                File(models, "kokoro-multi-lang-v1_0").deleteRecursively()
+                c.cacheDir.listFiles()?.filter { it.name.startsWith("kokoro") }?.forEach { it.delete() }
             }
+            if (base.usableSpace < 450_000_000L && !isInstalled(c)) {
+                return@withContext "Not enough free space (about 300 MB is needed)."
+            }
+            val todo = VOICES.filter { !isVoiceReady(c, it) }
+            val steps = todo.size + (if (espeakReady(c)) 0 else 1)
+            var step = 0
+            fun report(pct: Int, unpacking: Boolean) {
+                val total = steps.coerceAtLeast(1)
+                onProgress(((step * 100 + pct) / total).coerceIn(0, 100), unpacking)
+            }
+
             try {
-                val haveWholeFile = part.exists() && part.length() > 0 && marker.exists()
-                val needSpace = if (haveWholeFile) 300_000_000L else 500_000_000L
-                if (root.usableSpace < needSpace) {
-                    return@withContext "Not enough free space (about 500 MB is needed)."
+                for (v in todo) {
+                    val required = VOICES.indexOf(v) < REQUIRED
+                    val err = installVoice(c, v) { p, u -> report(p, u) }
+                    if (err != null) {
+                        if (required) return@withContext err
+                        // a bonus voice that cannot be fetched is skipped
+                    }
+                    step++
                 }
-
-                // 1) download (with resume), skipped when the whole file is already here
-                if (!haveWholeFile) {
-                    val err = download(part, marker, onProgress)
+                if (!espeakReady(c)) {
+                    val err = installEspeak(c) { p, u -> report(p, u) }
                     if (err != null) return@withContext err
+                    step++
                 }
-
-                // 2) unpack
-                unpacking = true
-                unpack(part, staging, onProgress)
-                unpacking = false
-
-                // 3) check and switch on
-                val ok = (File(staging, "model.int8.onnx").length() > 0 || File(staging, "model.onnx").length() > 0) &&
-                    File(staging, "voices.bin").length() > 0 &&
-                    File(staging, "tokens.txt").length() > 0 &&
-                    File(staging, "espeak-ng-data").isDirectory
-                if (!ok) {
-                    staging.deleteRecursively()
-                    part.delete()
-                    marker.delete()
-                    return@withContext "The downloaded voice pack was incomplete. Tap again to retry."
-                }
-                File(staging, ".ok").writeText("1")
-                val finalDir = dir(c)
-                finalDir.deleteRecursively()
-                if (!staging.renameTo(finalDir)) {
-                    staging.deleteRecursively()
-                    return@withContext "Could not save the voice pack."
-                }
-                part.delete()
-                marker.delete()
-                null
+                if (!isInstalled(c)) "The voice pack was incomplete. Tap again to retry." else null
             } catch (ce: CancellationException) {
-                // keep the downloaded file, so the next try does not download again
-                staging.deleteRecursively()
                 throw ce
             } catch (t: Throwable) {
-                staging.deleteRecursively()
-                if (unpacking) {
-                    val noSpace = t is OutOfMemoryError ||
-                        t.message.orEmpty().contains("space", ignoreCase = true) ||
-                        root.usableSpace < 100_000_000L
-                    if (!noSpace) {
-                        // the saved file is damaged: throw it away so the next try starts clean
-                        part.delete()
-                        marker.delete()
-                    }
-                }
                 "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
             }
         }
 
+    // ───────────────────────── one voice ─────────────────────────
+
+    private fun CoroutineScope.installVoice(
+        c: Context,
+        v: PiperVoice,
+        onProgress: (Int, Boolean) -> Unit,
+    ): String? {
+        val part = File(c.cacheDir, v.id + ".tar.bz2.part")
+        val marker = File(c.cacheDir, v.id + ".tar.bz2.done")
+        val staging = File(File(root(c), "voices"), v.id + ".tmp")
+        val espeakStaging = File(root(c), "espeak-ng-data.tmp")
+        try {
+            val whole = part.exists() && part.length() > 0 && marker.exists()
+            if (!whole) {
+                val err = download(BASE + v.id + ".tar.bz2", part, marker, onProgress)
+                if (err != null) return err
+            }
+            val needEspeak = !espeakReady(c)
+            staging.deleteRecursively()
+            staging.mkdirs()
+            if (needEspeak) {
+                espeakStaging.deleteRecursively()
+                espeakStaging.mkdirs()
+            }
+            var haveEspeakFiles = false
+            unpack(part, onProgress) { parts ->
+                val i = parts.indexOf("espeak-ng-data")
+                when {
+                    i >= 0 -> {
+                        if (!needEspeak || i == parts.size - 1) null
+                        else {
+                            haveEspeakFiles = true
+                            File(espeakStaging, parts.drop(i + 1).joinToString("/"))
+                        }
+                    }
+                    parts.last().endsWith(".onnx") -> File(staging, "model.onnx")
+                    parts.last() == "tokens.txt" -> File(staging, "tokens.txt")
+                    else -> null
+                }
+            }
+            if (File(staging, "model.onnx").length() <= 0 || File(staging, "tokens.txt").length() <= 0) {
+                staging.deleteRecursively()
+                espeakStaging.deleteRecursively()
+                part.delete(); marker.delete()
+                return "The voice ${v.label} was incomplete. Tap again to retry."
+            }
+            if (needEspeak && haveEspeakFiles && File(espeakStaging, "phontab").exists()) {
+                File(espeakStaging, ".ok").writeText("1")
+                val finalEspeak = espeakDir(c)
+                finalEspeak.deleteRecursively()
+                if (!espeakStaging.renameTo(finalEspeak)) espeakStaging.deleteRecursively()
+            } else {
+                espeakStaging.deleteRecursively()
+            }
+            File(staging, ".ok").writeText("1")
+            val finalDir = voiceDir(c, v)
+            finalDir.deleteRecursively()
+            if (!staging.renameTo(finalDir)) {
+                staging.deleteRecursively()
+                return "Could not save the voice ${v.label}."
+            }
+            part.delete(); marker.delete()
+            return null
+        } catch (ce: CancellationException) {
+            staging.deleteRecursively()
+            espeakStaging.deleteRecursively()
+            throw ce
+        } catch (t: Throwable) {
+            staging.deleteRecursively()
+            espeakStaging.deleteRecursively()
+            val noSpace = t is OutOfMemoryError ||
+                t.message.orEmpty().contains("space", ignoreCase = true) ||
+                root(c).usableSpace < 100_000_000L
+            if (!noSpace) { part.delete(); marker.delete() }
+            return "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+        }
+    }
+
+    /** Only needed when the voice packs did not carry the espeak data themselves. */
+    private fun CoroutineScope.installEspeak(c: Context, onProgress: (Int, Boolean) -> Unit): String? {
+        val part = File(c.cacheDir, "espeak-ng-data.tar.bz2.part")
+        val marker = File(c.cacheDir, "espeak-ng-data.tar.bz2.done")
+        val staging = File(root(c), "espeak-ng-data.tmp")
+        try {
+            if (!(part.exists() && part.length() > 0 && marker.exists())) {
+                val err = download(ESPEAK_URL, part, marker, onProgress)
+                if (err != null) return err
+            }
+            staging.deleteRecursively()
+            staging.mkdirs()
+            unpack(part, onProgress) { parts ->
+                val i = parts.indexOf("espeak-ng-data")
+                val rel = if (i >= 0) parts.drop(i + 1) else parts
+                if (rel.isEmpty()) null else File(staging, rel.joinToString("/"))
+            }
+            if (!File(staging, "phontab").exists()) {
+                staging.deleteRecursively(); part.delete(); marker.delete()
+                return "The language data was incomplete. Tap again to retry."
+            }
+            File(staging, ".ok").writeText("1")
+            val finalDir = espeakDir(c)
+            finalDir.deleteRecursively()
+            if (!staging.renameTo(finalDir)) {
+                staging.deleteRecursively()
+                return "Could not save the language data."
+            }
+            part.delete(); marker.delete()
+            return null
+        } catch (ce: CancellationException) {
+            staging.deleteRecursively()
+            throw ce
+        } catch (t: Throwable) {
+            staging.deleteRecursively()
+            part.delete(); marker.delete()
+            return "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+        }
+    }
+
+    // ───────────────────────── download / unpack ─────────────────────────
+
     /**
-     * Downloads the voice pack into [part] (resuming when a part is there).
+     * Downloads [url] into [part] (resuming when a part is there).
      * Returns null when the whole file is on the phone (and writes [marker]),
      * otherwise a short message for the person.
      */
     private fun CoroutineScope.download(
+        url: String,
         part: File,
         marker: File,
         onProgress: (Int, Boolean) -> Unit,
     ): String? {
         marker.delete()
         val have = if (part.exists()) part.length() else 0L
-        var conn = openFollowing(URL_TAR, have)
+        var conn = openFollowing(url, have)
         var code = conn.responseCode
         var resumeFrom = have
 
         if (code == 416) {
-            // "Range not satisfiable": we asked for bytes after the end, which means
-            // the saved file is already whole. Never ask for that range again.
+            // "Range not satisfiable": the saved file is already whole (or damaged).
             val range = conn.getHeaderField("Content-Range")
             conn.disconnect()
             val serverTotal = range?.substringAfter('/', "")?.trim()?.toLongOrNull()
@@ -152,10 +269,9 @@ object SherpaModels {
                 marker.writeText("1")
                 return null
             }
-            // the saved file is bigger than the real one (damaged): start again from zero
             part.delete()
             resumeFrom = 0L
-            conn = openFollowing(URL_TAR, 0L)
+            conn = openFollowing(url, 0L)
             code = conn.responseCode
         }
 
@@ -196,18 +312,16 @@ object SherpaModels {
     }
 
     /**
-     * Unpacks [part] (a .tar.bz2) into [staging]. The percentage moves while a
-     * big file (the model is one single, huge file) is being written, not only
-     * between files, so it no longer looks frozen.
+     * Unpacks a .tar.bz2. [target] gets the entry's path split into parts
+     * (e.g. ["vits-piper-x", "tokens.txt"]) and returns where to write it, or
+     * null to skip the entry. Nothing is ever written outside the folder that
+     * [target]'s files live in.
      */
     private fun CoroutineScope.unpack(
         part: File,
-        staging: File,
         onProgress: (Int, Boolean) -> Unit,
+        target: (List<String>) -> File?,
     ) {
-        staging.deleteRecursively()
-        staging.mkdirs()
-        val stagingPath = staging.canonicalPath
         val size = part.length().coerceAtLeast(1L)
         var lastUnpack = -1
         var lastTick = 0L
@@ -226,28 +340,22 @@ object SherpaModels {
                     while (true) {
                         ensureActive()
                         val e = tar.nextEntry ?: break
-                        var rel = e.name.replace('\\', '/')
-                        if (rel.startsWith("./")) rel = rel.removePrefix("./")
-                        rel = rel.replaceFirst(Regex("^kokoro[^/]*/"), "")
-                        if (rel.isEmpty() || rel.startsWith("kokoro")) continue
-                        val target = File(staging, rel)
-                        // never write outside the model folder
-                        if (!target.canonicalPath.startsWith(stagingPath + File.separator)) continue
-                        if (e.isDirectory) {
-                            target.mkdirs()
-                        } else {
-                            target.parentFile?.mkdirs()
-                            FileOutputStream(target).use { out ->
-                                while (true) {
-                                    ensureActive()
-                                    val n = tar.read(buf)
-                                    if (n < 0) break
-                                    out.write(buf, 0, n)
-                                    val now = System.nanoTime()
-                                    if (now - lastTick > 300_000_000L) {
-                                        lastTick = now
-                                        report()
-                                    }
+                        if (e.isDirectory) continue
+                        val parts = e.name.replace('\\', '/').split('/')
+                            .filter { it.isNotEmpty() && it != "." }
+                        if (parts.isEmpty() || parts.any { it == ".." }) continue
+                        val dest = target(parts) ?: continue
+                        dest.parentFile?.mkdirs()
+                        FileOutputStream(dest).use { out ->
+                            while (true) {
+                                ensureActive()
+                                val n = tar.read(buf)
+                                if (n < 0) break
+                                out.write(buf, 0, n)
+                                val now = System.nanoTime()
+                                if (now - lastTick > 300_000_000L) {
+                                    lastTick = now
+                                    report()
                                 }
                             }
                         }
