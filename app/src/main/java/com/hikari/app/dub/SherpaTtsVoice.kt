@@ -23,19 +23,21 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Offline neural voices (Kokoro through sherpa-onnx). Free, no internet, no
- * API key. Different characters get different actors.
+ * Offline neural voices (Piper through sherpa-onnx). Free, no internet, no
+ * API key, and fast: a line is made in a fraction of the time it takes to say
+ * it, so the whole video can be voiced ahead of the playhead.
  *
  * The voice itself runs in a separate helper process ([NeuralTtsService]), so
  * a crash or an out-of-memory in the voice can never take the player down:
- * this class only sends it "say this with actor N" and waits for the audio
- * file. If the helper dies twice, the neural voice switches itself off for
- * this dub and the normal voice takes over.
+ * this class only sends it "say this with voice X at speed Y" and waits for
+ * the audio file. If the helper dies twice, the neural voice switches itself
+ * off for this dub.
  *
- * Hindi has 4 actors in the model: hf_alpha (31), hf_beta (32) = women,
- * hm_omega (33), hm_psi (34) = men. A character keeps the same actor for the
- * whole video; the pitch / speed edit in [DubFx] then makes characters that
- * share an actor sound different from each other.
+ * Actors: three real Hindi speakers (Priyamvada = woman, Rohan and Pratham =
+ * men). A character keeps the same actor for the whole video. Characters that
+ * have to share a speaker get a different speaking speed (done inside the
+ * voice, so it stays clean) and a different pitch ([fxFor], applied by the
+ * audio editor), so two characters never sound the same.
  */
 class SherpaTtsVoice(context: Context) : DubVoice {
 
@@ -55,8 +57,8 @@ class SherpaTtsVoice(context: Context) : DubVoice {
     @Volatile var isLoaded: Boolean = false
         private set
 
-    // character -> actor, handed out in order of first appearance
-    private val assigned = ConcurrentHashMap<String, Int>()
+    // character -> actor, handed out in order of first appearance (guarded by itself)
+    private val assigned = HashMap<String, Actor>()
     private var maleCount = 0
     private var femaleCount = 0
 
@@ -135,14 +137,9 @@ class SherpaTtsVoice(context: Context) : DubVoice {
             service = null
             connected = CompletableDeferred()
             crashes++
-            // Three ways of starting the voice exist (see [NeuralTtsService]); one
-            // death is allowed per way before the neural voice gives up for this dub.
-            if (crashes >= MAX_DEATHS) broken = true
+            if (crashes >= 2) broken = true
             val step = lastStep()
             val tried = variant
-            // Only the requests that were waiting at THIS moment belong to the
-            // dead helper. A request sent after it restarted must not be failed.
-            val waitingIds = pending.keys.toList()
             // Android writes the reason a moment after the process ends.
             Handler(Looper.getMainLooper()).postDelayed({
                 val reason = exitReason()
@@ -154,7 +151,9 @@ class SherpaTtsVoice(context: Context) : DubVoice {
                 // This way of starting the voice did not survive: try the next
                 // one on the following attempt (unless it has worked before).
                 if (prefs.getInt("good_variant", -1) != tried) variant = (tried + 1) % 3
-                waitingIds.forEach { id -> pending.remove(id)?.complete("the voice helper stopped") }
+                val waiting = pending.values.toList()
+                pending.clear()
+                waiting.forEach { it.complete("the voice helper stopped") }
             }, 1_200L)
         }
 
@@ -215,10 +214,21 @@ class SherpaTtsVoice(context: Context) : DubVoice {
     override suspend fun synthesize(text: String, lang: String): File? =
         synthesize(text, lang, CastDirector.NARRATOR)
 
+    override fun fxFor(profile: VoiceProfile): VoiceProfile {
+        val a = try { actorFor(profile) } catch (t: Throwable) { return profile }
+        // speed is already inside the clip; only the pitch is left for the editor
+        return VoiceProfile(profile.gender, a.semitones, 1f, profile.name)
+    }
+
     override suspend fun synthesize(text: String, lang: String, profile: VoiceProfile): File? =
         withContext(Dispatchers.IO) {
-            val sid = actorFor(profile)
-            val out = File(dir, GoogleTtsVoice.key("n2", lang, "$sid|$text") + ".wav")
+            val actor = try {
+                actorFor(profile)
+            } catch (t: Throwable) {
+                lastError = "no neural voice is installed"
+                return@withContext null
+            }
+            val out = File(dir, GoogleTtsVoice.key("p1", lang, actor.voice.id + "|" + actor.speed + "|" + text) + ".wav")
             if (out.exists() && out.length() > 0) return@withContext out
 
             if (!ensureConnected()) return@withContext null
@@ -229,11 +239,12 @@ class SherpaTtsVoice(context: Context) : DubVoice {
             pending[id] = answer
             val data = Bundle().apply {
                 putInt(NeuralIpc.K_ID, id)
-                putString(NeuralIpc.K_DIR, SherpaModels.dir(app).path)
+                putString(NeuralIpc.K_DIR, SherpaModels.voiceDir(app, actor.voice).path)
+                putString(NeuralIpc.K_DATA, SherpaModels.espeakDir(app).path)
                 putString(NeuralIpc.K_TEXT, text)
-                putInt(NeuralIpc.K_SID, sid)
+                putInt(NeuralIpc.K_SID, 0)
+                putFloat(NeuralIpc.K_SPEED, actor.speed)
                 putString(NeuralIpc.K_OUT, out.path)
-                putString(NeuralIpc.K_LANG, lang.substringBefore('-').lowercase())
                 putInt(NeuralIpc.K_VARIANT, variant)
             }
             val msg = Message.obtain(null, NeuralIpc.MSG_SYNTH)
@@ -247,8 +258,8 @@ class SherpaTtsVoice(context: Context) : DubVoice {
                 return@withContext null
             }
 
-            // The first line also has to load the voice, so allow a long time.
-            val res = withTimeoutOrNull(120_000L) { answer.await() }
+            // The first line of each voice also has to load it, so allow a while.
+            val res = withTimeoutOrNull(90_000L) { answer.await() }
             pending.remove(id)
             when {
                 res == null -> {
@@ -285,26 +296,45 @@ class SherpaTtsVoice(context: Context) : DubVoice {
     private fun supports(lang: String): Boolean =
         lang.substringBefore('-').equals("hi", ignoreCase = true)
 
-    /** Picks the actor (speaker id inside the model) for a character. */
-    private fun actorFor(p: VoiceProfile): Int = synchronized(assigned) {
+    /** Which voice, how fast it speaks, and how much the editor shifts its pitch. */
+    private class Actor(val voice: PiperVoice, val speed: Float, val semitones: Float)
+
+    /** Picks the actor for a character (same character = same actor all video). */
+    private fun actorFor(p: VoiceProfile): Actor = synchronized(assigned) {
         assigned.getOrPut(p.name + "|" + p.key) {
+            val ready = SherpaModels.readyVoices(app)
             when {
-                p.name == "Narrator" -> HI_WOMAN[1]        // main / unnamed voice
-                p.name == "Voice B" -> HI_MAN[1]           // 2nd unnamed voice
-                p.gender == Gender.FEMALE -> HI_WOMAN[(femaleCount++) % HI_WOMAN.size]
-                p.gender == Gender.MALE -> HI_MAN[(maleCount++) % HI_MAN.size]
-                p.gender == Gender.CHILD -> HI_WOMAN[0]
-                else -> HI_WOMAN[1]
+                ready.isEmpty() -> error("no voice installed")
+                p.name == "Narrator" -> pick(true, 0, ready)       // main / unnamed voice
+                p.name == "Voice B" -> pick(false, 0, ready)       // 2nd unnamed voice
+                p.gender == Gender.FEMALE -> pick(true, femaleCount++, ready)
+                p.gender == Gender.MALE -> pick(false, maleCount++, ready)
+                p.gender == Gender.CHILD -> {
+                    val w = ready.firstOrNull { it.gender == Gender.FEMALE } ?: ready.first()
+                    Actor(w, 1.08f, 4.5f)
+                }
+                else -> pick(true, 0, ready)
             }
         }
     }
 
-    companion object {
-        /** How many times the helper may die in one dub (one per way of starting it). */
-        private const val MAX_DEATHS = 3
+    /**
+     * The k-th woman / man of the video. Real speakers are used first
+     * (round robin); once they are all taken the next character shares a
+     * speaker but speaks at a different speed and pitch.
+     */
+    private fun pick(female: Boolean, k: Int, ready: List<PiperVoice>): Actor {
+        val own = ready.filter { (it.gender == Gender.FEMALE) == female }
+        val pool = if (own.isNotEmpty()) own else ready
+        val look = (if (female) FEMALE_LOOK else MALE_LOOK)[(k / pool.size) % FEMALE_LOOK.size]
+        // no voice of that sex is installed: borrow the other one and move its pitch
+        val borrow = if (own.isEmpty()) (if (female) 4.5f else -4.5f) else 0f
+        return Actor(pool[k % pool.size], look.second, look.first + borrow)
+    }
 
-        /** Kokoro multi-lang v1.0 speaker ids: hf_alpha, hf_beta, hm_omega, hm_psi. */
-        private val HI_WOMAN = intArrayOf(32, 31)
-        private val HI_MAN = intArrayOf(34, 33)
+    companion object {
+        /** (pitch in semitones, speed) for the 1st, 2nd, 3rd ... character on one speaker. */
+        private val FEMALE_LOOK = listOf(0f to 1.00f, 2.0f to 1.06f, -1.5f to 0.95f, 3.5f to 1.10f)
+        private val MALE_LOOK = listOf(0f to 1.00f, -2.0f to 0.95f, 1.5f to 1.06f, -3.5f to 0.92f)
     }
 }
