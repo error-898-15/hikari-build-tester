@@ -2,8 +2,12 @@ package com.hikari.app.dub
 
 import java.util.Locale
 
-/** How a line should be delivered (decided from the subtitle, no AI needed). */
-enum class Emotion { NORMAL, SHOUT, WHISPER, SAD, EXCITED }
+/**
+ * How a line should be delivered (decided from the subtitle, no AI needed).
+ * The audio editor ([DubFx]) turns each one into a different way of speaking:
+ * pitch movement, speed, loudness, breath, roughness, trembling.
+ */
+enum class Emotion { NORMAL, SHOUT, WHISPER, SAD, EXCITED, ANGRY, HAPPY, FEAR, SURPRISE }
 
 /**
  * One timed line of a subtitle file.
@@ -66,10 +70,24 @@ object SubtitleCues {
         """(?i)\b(?:laugh|chuckl|giggl|sigh|gasp|groan|moan|cough|sneez|scream|shout|yell|cry|cries|crying|sob|weep|whisper|mutter|murmur|sing|hum|music|applaus|cheer|knock|ring|beep|buzz|bell|footstep|door|phone|thunder|wind|breath|sniff|snicker|growl|grunt|scoff|clears? throat|inaudible|indistinct|silence|pause|static|crowd|speaking|speaks|says|continues|o\.s|v\.o|off-screen|narrat|gunshot|explosion|crash|slam|screech|chatter|echo|sfx|sound|noise)"""
     )
 
+    // Delivery hints written in the subtitle: "[angrily]", "(crying)", "(whispers)" ...
     private val H_WHISPER = Regex("""whisper|murmur|mutter|softly|quietly|hushed|low voice""")
-    private val H_SHOUT = Regex("""shout|yell|scream|roar|bellow|angrily|furious|exclaim""")
-    private val H_SAD = Regex("""cry|sob|weep|tearful|sniffl|sorrow|sadly|trembl|sigh""")
-    private val H_HAPPY = Regex("""excitedly|cheerfully|happily|joyful|giggl|laughing|laughs|chuckl|eager""")
+    private val H_ANGRY = Regex("""angry|angrily|furious|furiously|growl|snarl|seeth|enraged|rage|hiss|sneer|scoff|coldly|bitter|irritated|annoyed|snap""")
+    private val H_SHOUT = Regex("""shout|yell|scream|roar|bellow|exclaim|cry out|call out|battle cry""")
+    private val H_FEAR = Regex("""scared|afraid|fear|terrified|frighten|panic|gasp|trembl|nervous|stammer|stutter|shak|horrif|whimper""")
+    private val H_SURPRISE = Regex("""surpris|shock|astonish|stunned|disbelie|startl|incredul|amaz""")
+    private val H_SAD = Regex("""cry|sob|weep|tearful|sniffl|sorrow|sadly|sigh|mourn|grie|heartbroken|choked|voice breaking|lament|despair|dejected""")
+    private val H_EXCITED = Regex("""excitedly|eager|enthusias|thrilled|energetic|hyped""")
+    private val H_HAPPY = Regex("""cheerfully|happily|joyful|giggl|laughing|laughs|laugh|chuckl|smil|warmly|playful|teasing|amused|delighted|gleeful""")
+
+    // Feelings read from the words themselves (used when there is no hint).
+    private val T_ANGRY = Regex("""(?i)\b(?:damn|damned|bastard|idiot|stupid|shut up|how dare|i(?:'ll| will) kill|you fool|hate you|get out|go away|don'?t touch|bullshit|asshole|screw you|liar|traitor|disgusting|pathetic|worthless|monster|scum|trash|die)\b""")
+    private val T_FEAR = Regex("""(?i)\b(?:help|run|please don'?t|don'?t kill|stay away|get away|don'?t hurt|ghost|scared|afraid|terrified|oh god|oh no|can'?t be|behind you|look out|watch out|it'?s coming|we'?re going to die|no no)\b""")
+    private val T_SURPRISE = Regex("""(?i)\b(?:no way|what the|you'?re kidding|are you serious|impossible|unbelievable|can'?t believe|since when)\b""")
+    private val T_SURPRISE_SHORT = Regex("""(?i)\b(?:what|huh|really|seriously|eh|ehh)\b""")
+    private val T_SAD = Regex("""(?i)\b(?:miss you|i miss|lonely|never see|goodbye|farewell|funeral|tears|crying|it hurts|my fault|forgive me|i failed|too late|don'?t leave|please don'?t go|regret|so sorry|passed away|died)\b""")
+    private val T_HAPPY = Regex("""(?i)\b(?:yay|yes|awesome|great|wonderful|amazing|thank you|thanks|congratulations|we did it|we won|finally|love you|so happy|nice|wow|fantastic|beautiful|perfect|good job|well done)\b""")
+    private val T_LAUGH = Regex("""(?i)\b(?:(?:ha){2,}|(?:he){2,}|ha ha|he he|lol)\b""")
 
     private val LEAD_ELLIPSIS = Regex("""^\s*(?:\.{2,}|…)\s*""")
     private val TRAIL_ELLIPSIS = Regex("""\s*(?:\.{2,}|…)\s*$""")
@@ -314,19 +332,39 @@ object SubtitleCues {
     // ───────────────────────── delivery ─────────────────────────
 
     private fun emotionOf(hint: String, text: String): Emotion {
+        // 1) the subtitle says it ("[angrily]", "(crying)" ...): believe it
         val h = hint.lowercase(Locale.ROOT)
         if (h.isNotBlank()) {
             if (H_WHISPER.containsMatchIn(h)) return Emotion.WHISPER
+            if (H_ANGRY.containsMatchIn(h)) return Emotion.ANGRY
             if (H_SHOUT.containsMatchIn(h)) return Emotion.SHOUT
+            if (H_FEAR.containsMatchIn(h)) return Emotion.FEAR
+            if (H_SURPRISE.containsMatchIn(h)) return Emotion.SURPRISE
             if (H_SAD.containsMatchIn(h)) return Emotion.SAD
-            if (H_HAPPY.containsMatchIn(h)) return Emotion.EXCITED
+            if (H_EXCITED.containsMatchIn(h)) return Emotion.EXCITED
+            if (H_HAPPY.containsMatchIn(h)) return Emotion.HAPPY
         }
+
+        // 2) read it from the words and the punctuation
         val letters = text.filter { it.isLetter() }
-        if (letters.length >= 4 && letters.any { it.isUpperCase() } && letters.none { it.isLowerCase() }) {
-            return Emotion.SHOUT
+        val bang = text.contains('!')
+        val ask = text.contains('?')
+        val dots = text.contains("...") || text.contains('\u2026')
+        val allCaps = letters.length >= 4 && letters.any { it.isUpperCase() } && letters.none { it.isLowerCase() }
+        val angryWords = T_ANGRY.containsMatchIn(text)
+
+        if (allCaps || text.contains("!!")) {
+            return if (angryWords) Emotion.ANGRY else Emotion.SHOUT
         }
-        if (text.contains("!!")) return Emotion.SHOUT
-        if (text.contains("?!") || text.contains("!?")) return Emotion.EXCITED
+        if (bang && angryWords) return Emotion.ANGRY
+        if ((bang || dots) && T_FEAR.containsMatchIn(text)) return Emotion.FEAR
+        if (text.contains("?!") || text.contains("!?")) return Emotion.SURPRISE
+        if ((bang || ask) && T_SURPRISE.containsMatchIn(text)) return Emotion.SURPRISE
+        if ((bang || ask) && text.length <= 14 && T_SURPRISE_SHORT.containsMatchIn(text)) return Emotion.SURPRISE
+        if (T_LAUGH.containsMatchIn(text)) return Emotion.HAPPY
+        if (T_SAD.containsMatchIn(text) && !angryWords) return Emotion.SAD
+        if (bang && T_HAPPY.containsMatchIn(text)) return Emotion.HAPPY
+        if (bang) return Emotion.EXCITED
         return Emotion.NORMAL
     }
 
