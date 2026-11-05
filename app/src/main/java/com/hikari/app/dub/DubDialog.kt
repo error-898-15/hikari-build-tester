@@ -128,6 +128,13 @@ object DubDialog {
             root.addView(castInfo)
         }
 
+        // The neural voice stopped last time: say why (so it can be fixed).
+        engine.neuralReport()?.let { r ->
+            root.addView(
+                note(I18n.t("Last neural voice problem") + ": " + r)
+            )
+        }
+
         // 2) language
         val langs = Translator.LANGUAGES
         root.addView(label(I18n.t("Dub language")))
