@@ -149,8 +149,7 @@ class DubEngine(
         liveSeen = false
         liveQueue.clear()
         val neuralLikely = (mode == VoiceMode.NEURAL || mode == VoiceMode.AUTO) &&
-            lang.substringBefore('-').equals("hi", ignoreCase = true) &&
-            SherpaModels.isInstalled(context)
+            SherpaModels.isInstalledFor(context, lang)
         lookaheadMs = if (neuralLikely) NEURAL_LOOKAHEAD_MS else LOOKAHEAD_MS
         if (translations.size > 4000) translations.clear()
         attempts.clear()
