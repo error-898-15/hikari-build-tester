@@ -15,8 +15,17 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
-/** One offline Hindi voice (a Piper model run by sherpa-onnx). */
-data class PiperVoice(val id: String, val gender: Gender, val label: String)
+/**
+ * One offline voice (run by sherpa-onnx): a Hindi Piper voice, or an English
+ * Kokoro voice ([kokoro] = true; [sid] is its speaker number inside the Kokoro pack).
+ */
+data class PiperVoice(
+    val id: String,
+    val gender: Gender,
+    val label: String,
+    val sid: Int = 0,
+    val kokoro: Boolean = false,
+)
 
 /**
  * The offline neural voices (Piper, run through sherpa-onnx): three real,
@@ -47,6 +56,54 @@ object SherpaModels {
     )
     private const val REQUIRED = 2
 
+    // ───────────────────────── English voices (Kokoro) ─────────────────────────
+
+    /** Kokoro v1.0, 8-bit (about 130 MB). One pack holds many speakers. */
+    private const val KOKORO_URL = BASE + "kokoro-int8-multi-lang-v1_0.tar.bz2"
+    private const val KOKORO_DIR = "kokoro-en-pack"
+
+    /** English actors: one woman (af_heart = speaker 3) and one man (am_michael = speaker 16). */
+    val KOKORO_VOICES: List<PiperVoice> = listOf(
+        PiperVoice("kokoro-af_heart", Gender.FEMALE, "Heart", sid = 3, kokoro = true),
+        PiperVoice("kokoro-am_michael", Gender.MALE, "Michael", sid = 16, kokoro = true),
+    )
+
+    private fun kokoroRoot(c: Context): File = File(File(c.filesDir, "dub_models"), KOKORO_DIR)
+
+    fun kokoroDir(c: Context): File = kokoroRoot(c)
+
+    fun kokoroEspeakDir(c: Context): File = File(kokoroRoot(c), "espeak-ng-data")
+
+    private fun kokoroModelFile(c: Context): File {
+        val int8 = File(kokoroRoot(c), "model.int8.onnx")
+        return if (int8.length() > 0) int8 else File(kokoroRoot(c), "model.onnx")
+    }
+
+    fun isKokoroReady(c: Context): Boolean {
+        val d = kokoroRoot(c)
+        return File(d, ".ok").exists() &&
+            kokoroModelFile(c).length() > 0 &&
+            File(d, "voices.bin").length() > 0 &&
+            File(d, "tokens.txt").length() > 0 &&
+            File(d, "lexicon-us-en.txt").length() > 0 &&
+            File(kokoroEspeakDir(c), "phontab").exists()
+    }
+
+    /** The voices that speak [lang] and are on the phone: Hindi = Piper, English = Kokoro. */
+    fun readyVoicesFor(c: Context, lang: String): List<PiperVoice> =
+        when (lang.substringBefore('-').lowercase()) {
+            "hi" -> readyVoices(c)
+            "en" -> if (isKokoroReady(c)) KOKORO_VOICES else emptyList()
+            else -> emptyList()
+        }
+
+    fun isInstalledFor(c: Context, lang: String): Boolean =
+        when (lang.substringBefore('-').lowercase()) {
+            "hi" -> isInstalled(c)
+            "en" -> isKokoroReady(c)
+            else -> false
+        }
+
     private fun root(c: Context): File = File(File(c.filesDir, "dub_models"), "piper-hi")
 
     /** Folder with the espeak-ng data (shared by every voice). */
@@ -71,6 +128,79 @@ object SherpaModels {
 
     fun delete(c: Context) {
         root(c).deleteRecursively()
+        kokoroRoot(c).deleteRecursively()
+    }
+
+    /**
+     * Downloads (resuming a half-finished download) and unpacks the English
+     * voices (Kokoro, about 130 MB). Same contract as [install].
+     */
+    suspend fun installKokoro(c: Context, onProgress: (Int, Boolean) -> Unit): String? =
+        withContext(Dispatchers.IO) {
+            if (isKokoroReady(c)) return@withContext null
+            val base = kokoroRoot(c).parentFile ?: return@withContext "Could not use the phone storage."
+            base.mkdirs()
+            if (base.usableSpace < 500_000_000L) {
+                return@withContext "Not enough free space (about 400 MB is needed)."
+            }
+            try {
+                installKokoroPack(c, onProgress)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+            }
+        }
+
+    private fun CoroutineScope.installKokoroPack(c: Context, onProgress: (Int, Boolean) -> Unit): String? {
+        val part = File(c.cacheDir, "dubk-en.tar.bz2.part")
+        val marker = File(c.cacheDir, "dubk-en.tar.bz2.done")
+        val finalDir = kokoroRoot(c)
+        val staging = File(finalDir.parentFile, KOKORO_DIR + ".tmp")
+        try {
+            val whole = part.exists() && part.length() > 0 && marker.exists()
+            if (!whole) {
+                val err = download(KOKORO_URL, part, marker, onProgress)
+                if (err != null) return err
+            }
+            staging.deleteRecursively()
+            staging.mkdirs()
+            // The pack has one top folder: drop it, keep everything under it as it is.
+            unpack(part, onProgress) { parts ->
+                val rel = if (parts.size > 1) parts.drop(1) else parts
+                File(staging, rel.joinToString("/"))
+            }
+            val hasModel = File(staging, "model.int8.onnx").length() > 0 ||
+                File(staging, "model.onnx").length() > 0
+            if (!hasModel ||
+                File(staging, "voices.bin").length() <= 0 ||
+                File(staging, "tokens.txt").length() <= 0 ||
+                File(staging, "lexicon-us-en.txt").length() <= 0 ||
+                !File(File(staging, "espeak-ng-data"), "phontab").exists()
+            ) {
+                staging.deleteRecursively()
+                part.delete(); marker.delete()
+                return "The English voice pack was incomplete. Tap again to retry."
+            }
+            File(staging, ".ok").writeText("1")
+            finalDir.deleteRecursively()
+            if (!staging.renameTo(finalDir)) {
+                staging.deleteRecursively()
+                return "Could not save the English voices."
+            }
+            part.delete(); marker.delete()
+            return null
+        } catch (ce: CancellationException) {
+            staging.deleteRecursively()
+            throw ce
+        } catch (t: Throwable) {
+            staging.deleteRecursively()
+            val noSpace = t is OutOfMemoryError ||
+                t.message.orEmpty().contains("space", ignoreCase = true) ||
+                finalDir.parentFile?.usableSpace.let { it != null && it < 100_000_000L }
+            if (!noSpace) { part.delete(); marker.delete() }
+            return "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+        }
     }
 
     /**
