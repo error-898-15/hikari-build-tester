@@ -4,6 +4,9 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.app.ActivityManager
+import android.app.ApplicationExitInfo
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
@@ -57,6 +60,49 @@ class SherpaTtsVoice(context: Context) : DubVoice {
     private var maleCount = 0
     private var femaleCount = 0
 
+    // ───────────────────────── what went wrong (for the person) ─────────────────────────
+
+    private val prefs by lazy { app.getSharedPreferences("neural_voice", Context.MODE_PRIVATE) }
+    private val traceFile get() = File(dir, NeuralIpc.TRACE_FILE)
+
+    /** Which way of starting the voice is tried now (see [NeuralTtsService]). */
+    private var variant: Int
+        get() = prefs.getInt("variant", 0).coerceIn(0, 2)
+        set(v) { prefs.edit().putInt("variant", v).apply() }
+
+    /** A short note about the last problem, or null when there was none. */
+    fun report(): String? = prefs.getString("report", null)
+
+    private fun lastStep(): String =
+        try {
+            traceFile.readLines().lastOrNull { it.isNotBlank() } ?: "before it started"
+        } catch (t: Throwable) {
+            "unknown"
+        }
+
+    /** Why Android says the helper process ended (Android 11 and newer). */
+    private fun exitReason(): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return ""
+        return try {
+            val am = app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val e = am.getHistoricalProcessExitReasons(app.packageName, 0, 12)
+                .firstOrNull { it.processName.endsWith(":neuraltts") } ?: return ""
+            val name = when (e.reason) {
+                ApplicationExitInfo.REASON_LOW_MEMORY -> "ran out of memory"
+                ApplicationExitInfo.REASON_CRASH_NATIVE -> "native crash"
+                ApplicationExitInfo.REASON_CRASH -> "crash"
+                ApplicationExitInfo.REASON_SIGNALED -> "killed by signal"
+                ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "used too many resources"
+                ApplicationExitInfo.REASON_EXIT_SELF -> "exited by itself"
+                ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "failed to start"
+                else -> "reason " + e.reason
+            }
+            name + " " + (e.description ?: "") + " (memory " + (e.rss / 1024L) + " MB)"
+        } catch (t: Throwable) {
+            ""
+        }
+    }
+
     // ───────────────────────── helper process link ─────────────────────────
 
     private val pending = ConcurrentHashMap<Int, CompletableDeferred<String>>()
@@ -89,13 +135,24 @@ class SherpaTtsVoice(context: Context) : DubVoice {
             service = null
             connected = CompletableDeferred()
             crashes++
-            val why = "the voice helper stopped (the phone probably ran out of memory)"
-            lastError = why
-            Logs.log("Dub", "Neural voice helper process died ($crashes)")
-            val waiting = pending.values.toList()
-            pending.clear()
-            waiting.forEach { it.complete(why) }
             if (crashes >= 2) broken = true
+            val step = lastStep()
+            val tried = variant
+            // Android writes the reason a moment after the process ends.
+            Handler(Looper.getMainLooper()).postDelayed({
+                val reason = exitReason()
+                val note = "way " + tried + " · last step: " + step +
+                    (if (reason.isNotEmpty()) " · " + reason else "")
+                prefs.edit().putString("report", note).apply()
+                Logs.log("Dub", "Neural voice helper died: $note")
+                lastError = "the voice helper stopped ($note)"
+                // This way of starting the voice did not survive: try the next
+                // one on the following attempt (unless it has worked before).
+                if (prefs.getInt("good_variant", -1) != tried) variant = (tried + 1) % 3
+                val waiting = pending.values.toList()
+                pending.clear()
+                waiting.forEach { it.complete("the voice helper stopped") }
+            }, 1_200L)
         }
 
         override fun onBindingDied(name: ComponentName?) {
@@ -105,6 +162,7 @@ class SherpaTtsVoice(context: Context) : DubVoice {
 
     private suspend fun ensureConnected(): Boolean {
         if (!bound) {
+            try { traceFile.delete() } catch (t: Throwable) {}
             bound = try {
                 app.bindService(Intent(app, NeuralTtsService::class.java), conn, Context.BIND_AUTO_CREATE)
             } catch (t: Throwable) {
@@ -173,6 +231,7 @@ class SherpaTtsVoice(context: Context) : DubVoice {
                 putInt(NeuralIpc.K_SID, sid)
                 putString(NeuralIpc.K_OUT, out.path)
                 putString(NeuralIpc.K_LANG, lang.substringBefore('-').lowercase())
+                putInt(NeuralIpc.K_VARIANT, variant)
             }
             val msg = Message.obtain(null, NeuralIpc.MSG_SYNTH)
             msg.data = data
@@ -200,7 +259,11 @@ class SherpaTtsVoice(context: Context) : DubVoice {
                     null
                 }
                 out.exists() && out.length() > 0 -> {
-                    isLoaded = true
+                    if (!isLoaded) {
+                        isLoaded = true
+                        // It works: remember the way that worked, forget old problems.
+                        prefs.edit().putInt("good_variant", variant).remove("report").apply()
+                    }
                     out
                 }
                 else -> {
