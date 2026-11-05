@@ -15,6 +15,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import android.os.SystemClock
+import com.hikari.app.data.Logs
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
@@ -80,6 +81,9 @@ class DubEngine(
     private var lastPos = 0L
 
     val active: Boolean get() = loop?.isActive == true
+
+    /** A short note about why the neural voice last stopped (null = no problem). */
+    fun neuralReport(): String? = neural.report()
     var activeLang: String = ""
         private set
 
@@ -408,7 +412,8 @@ class DubEngine(
                 neuralProblemShown = true
                 val why = neural.lastError ?: "unknown reason"
                 withContext(Dispatchers.Main) {
-                    onStatus("Dub: the neural voice failed ($why). Using the normal voice instead.")
+                    Logs.log("Dub", "Neural voice failed: $why")
+                    onStatus("Dub: the neural voice stopped, so the normal voice is used. Open Dub audio to see why.")
                 }
             }
         }
