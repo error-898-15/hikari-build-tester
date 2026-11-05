@@ -149,7 +149,7 @@ object DubDialog {
             I18n.t("Automatic (Google, then phone voice)"),
             I18n.t("Google Translate voice (online)"),
             I18n.t("Phone voice (offline)"),
-            I18n.t("Neural voice - offline, best quality (Hindi, many actors)"),
+            I18n.t("Neural voice - offline, fast, 3 real actors (Hindi)"),
         )
         root.addView(label(I18n.t("Voice")))
         val voiceSpinner = spinner(voiceNames, DubPrefs.mode(activity).ordinal)
@@ -213,7 +213,7 @@ object DubDialog {
 }
 
 /**
- * First use of the neural voice: downloads the voice pack once (about 130
+ * First use of the neural voice: downloads the three voices once (about 190
  * MB, from GitHub) and shows the progress. [onDone] gets true when it is ready.
  */
 internal object NeuralDownload {
@@ -224,7 +224,7 @@ internal object NeuralDownload {
 
         val status = TextView(activity).apply {
             textSize = 13f
-            text = I18n.t("Downloading the voice pack once (about 130 MB). Keep this screen open and stay on Wi-Fi.")
+            text = I18n.t("Downloading the voices once (3 voices, about 190 MB). Keep this screen open and stay on Wi-Fi.")
         }
         val bar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
