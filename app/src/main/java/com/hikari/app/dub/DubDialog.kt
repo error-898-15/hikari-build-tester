@@ -27,12 +27,15 @@ object DubPrefs {
     fun lang(c: Context): String = p(c).getString("lang", "en") ?: "en"
     fun mode(c: Context): VoiceMode =
         runCatching { VoiceMode.valueOf(p(c).getString("mode", "AUTO")!!) }.getOrDefault(VoiceMode.AUTO)
-    fun duck(c: Context): Float = p(c).getFloat("duck", 0.15f)
+    /** How much of the original is left while the dub speaks. Silent (0) by default:
+     *  the original dialogue is taken out, the music and effects stay. The key is
+     *  "duck2" so the old default (Quiet) does not carry over. */
+    fun duck(c: Context): Float = p(c).getFloat("duck2", 0f)
     /** Own voice for every character + edited audio (on by default). */
     fun smart(c: Context): Boolean = p(c).getBoolean("smart", true)
     fun saveSmart(c: Context, v: Boolean) { p(c).edit().putBoolean("smart", v).apply() }
     fun save(c: Context, lang: String, mode: VoiceMode, duck: Float) {
-        p(c).edit().putString("lang", lang).putString("mode", mode.name).putFloat("duck", duck).apply()
+        p(c).edit().putString("lang", lang).putString("mode", mode.name).putFloat("duck2", duck).apply()
     }
 }
 
