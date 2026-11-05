@@ -180,10 +180,18 @@ object NameGender {
  * The voices chosen for one subtitle: every named character gets a voice of
  * its own (same character = same voice for the whole video).
  */
-class Cast(val roster: List<Pair<String, VoiceProfile>>) {
+class Cast(
+    val roster: List<Pair<String, VoiceProfile>>,
+    /** Voice of every line that has no character name (decided in advance, see
+     *  [CastDirector.assign]). Keyed by the cue object itself. */
+    private val anon: Map<DubCue, VoiceProfile> = emptyMap(),
+) {
 
     private val byKey: Map<String, VoiceProfile> =
         roster.associate { (name, profile) -> CastDirector.keyOf(name) to profile }
+
+    /** Counts the lines handed out in live mode (no cue list to plan from). */
+    private val liveTurn = java.util.concurrent.atomic.AtomicInteger(0)
 
     fun profileFor(cue: DubCue): VoiceProfile {
         val s = cue.speaker
@@ -191,10 +199,11 @@ class Cast(val roster: List<Pair<String, VoiceProfile>>) {
             val p = byKey[CastDirector.keyOf(s)]
             if (p != null) return p
         }
-        // Lines with no name: the main voice; the 2nd line of a "- Hi / - Hello"
-        // exchange gets a second (male-sounding) voice so two people never
-        // share one voice.
-        return if (cue.turn % 2 == 1) CastDirector.SECOND else CastDirector.NARRATOR
+        // Lines with no name: a man or a woman, planned for the whole subtitle.
+        anon[cue]?.let { return it }
+        // Live captions (no list to plan from): man and woman take turns.
+        val n = liveTurn.getAndIncrement()
+        return CastDirector.anonVoice(n % 2 == 1, n / 2)
     }
 
     /** "Naruto ♂, Sakura ♀" — shown in the dub panel. Empty when no names. */
@@ -216,8 +225,23 @@ object CastDirector {
     /** Main / unnamed voice: the base voice, untouched. */
     val NARRATOR = VoiceProfile(Gender.NEUTRAL, 0f, 1f, "Narrator")
 
-    /** Second unnamed voice of a two-person exchange. */
-    val SECOND = VoiceProfile(Gender.MALE, -4.5f, 1f, "Voice B")
+    /** Second unnamed voice of a two-person exchange (the old man's voice). */
+    val SECOND = VoiceProfile(Gender.MALE, -6.0f, 1f, "Voice B")
+
+    /** New artists, added next to the two old ones: another woman ("Voice C")
+     *  and another man ("Voice D", lighter than "Voice B"). */
+    val FEMALE_B = VoiceProfile(Gender.FEMALE, 2.0f, 1.03f, "Voice C")
+    val MALE_B = VoiceProfile(Gender.MALE, -4.5f, 1.04f, "Voice D")
+
+    private val ANON_FEMALE = listOf(NARRATOR, FEMALE_B)
+    private val ANON_MALE = listOf(SECOND, MALE_B)
+
+    /** The [k]-th unnamed woman / man voice (old artist first, then the new one). */
+    fun anonVoice(male: Boolean, k: Int): VoiceProfile =
+        (if (male) ANON_MALE else ANON_FEMALE)[k % 2]
+
+    /** A pause this long after a finished sentence is taken as someone else talking. */
+    private const val TURN_GAP_MS = 600L
 
     // The first male is a normal deep voice, the next ones differ a little in
     // depth and speed so two men in one scene never sound identical.
@@ -266,6 +290,56 @@ object CastDirector {
             }
             seen[key] = name to profile
         }
-        return Cast(seen.values.toList())
+        return Cast(seen.values.toList(), planUnnamed(cues))
+    }
+
+    private fun endsSentence(t: String): Boolean {
+        val last = t.trimEnd('"', '\'', '\u201D', '\u2019', ')', ' ').lastOrNull() ?: return true
+        return last in ".!?\u3002\uFF01\uFF1F\u061F"
+    }
+
+    /**
+     * Subtitles usually do not say who talks. The speaker cannot be known, so
+     * every new "turn" (a pause after a finished sentence, or the second line
+     * of a "- Hi / - Hello" exchange) gets a man or a woman at random. The
+     * draw is repeatable (same subtitle = same voices), it never gives the
+     * same sex three turns in a row, and the answer in a "- Hi / - Hello"
+     * exchange is always the other sex. A wrong guess (a man's line read by a
+     * woman) is accepted; what matters is that both kinds of voice are heard.
+     */
+    private fun planUnnamed(cues: List<DubCue>): Map<DubCue, VoiceProfile> {
+        val out = java.util.IdentityHashMap<DubCue, VoiceProfile>()
+        val rnd = java.util.Random(31L * cues.size + (cues.firstOrNull()?.startMs ?: 0L))
+        var male = false
+        var run = 0
+        val taken = intArrayOf(0, 0)          // turns given so far: [women, men]
+        var current = NARRATOR
+        var prev: DubCue? = null
+        for (cue in cues) {
+            if (cue.speaker != null) {        // a named character has its own voice
+                prev = cue
+                continue
+            }
+            val p = prev
+            val newTurn = p == null ||
+                cue.turn > 0 ||
+                (cue.startMs - p.endMs >= TURN_GAP_MS && endsSentence(p.text))
+            if (newTurn) {
+                val was = male
+                male = when {
+                    p == null -> rnd.nextBoolean()
+                    cue.turn > 0 -> !was
+                    run >= 2 -> !was
+                    else -> rnd.nextBoolean()
+                }
+                run = if (p != null && male == was) run + 1 else 1
+                val idx = if (male) 1 else 0
+                current = anonVoice(male, taken[idx])
+                taken[idx] = taken[idx] + 1
+            }
+            out[cue] = current
+            prev = cue
+        }
+        return out
     }
 }
