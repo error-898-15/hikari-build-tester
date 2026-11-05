@@ -1,50 +1,138 @@
 package com.hikari.app.dub
 
+import android.content.ComponentName
 import android.content.Context
-import com.k2fsa.sherpa.onnx.OfflineTts
-import com.k2fsa.sherpa.onnx.OfflineTtsConfig
-import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
-import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.Message
+import android.os.Messenger
+import com.hikari.app.data.Logs
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
-import java.io.RandomAccessFile
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Offline neural voices (Kokoro through sherpa-onnx). Free, no internet, no
- * API key. Different characters get different actors:
+ * API key. Different characters get different actors.
  *
- *   Hindi has 4 actors in the model: hf_alpha (31), hf_beta (32) = women,
- *   hm_omega (33), hm_psi (34) = men. A character keeps the same actor for
- *   the whole video; the pitch / speed edit in [DubFx] then makes characters
- *   that share an actor sound different from each other.
+ * The voice itself runs in a separate helper process ([NeuralTtsService]), so
+ * a crash or an out-of-memory in the voice can never take the player down:
+ * this class only sends it "say this with actor N" and waits for the audio
+ * file. If the helper dies twice, the neural voice switches itself off for
+ * this dub and the normal voice takes over.
  *
- * Only Hindi for now. More languages = one more entry in [actors].
+ * Hindi has 4 actors in the model: hf_alpha (31), hf_beta (32) = women,
+ * hm_omega (33), hm_psi (34) = men. A character keeps the same actor for the
+ * whole video; the pitch / speed edit in [DubFx] then makes characters that
+ * share an actor sound different from each other.
  */
-class SherpaTtsVoice(private val context: Context) : DubVoice {
+class SherpaTtsVoice(context: Context) : DubVoice {
 
     override val label = "Neural voice (offline)"
 
-    private val dir = File(context.cacheDir, "dub").apply { mkdirs() }
-    private val lock = Any()
+    private val app: Context = context.applicationContext
+    private val dir = File(app.cacheDir, "dub").apply { mkdirs() }
 
-    @Volatile private var tts: OfflineTts? = null
     @Volatile private var broken = false
+    @Volatile private var crashes = 0
 
     /** Why the last attempt failed (shown to the person so we can fix it). */
     @Volatile var lastError: String? = null
         private set
 
-    /** True once the model is loaded in memory. */
-    val isLoaded: Boolean get() = tts != null
+    /** True once the voice has produced audio in this run. */
+    @Volatile var isLoaded: Boolean = false
+        private set
 
     // character -> actor, handed out in order of first appearance
     private val assigned = ConcurrentHashMap<String, Int>()
     private var maleCount = 0
     private var femaleCount = 0
+
+    // ───────────────────────── helper process link ─────────────────────────
+
+    private val pending = ConcurrentHashMap<Int, CompletableDeferred<String>>()
+    private val nextId = AtomicInteger(1)
+
+    @Volatile private var service: Messenger? = null
+    @Volatile private var connected = CompletableDeferred<Unit>()
+    @Volatile private var bound = false
+
+    private val replies = Messenger(
+        Handler(Looper.getMainLooper()) { msg ->
+            if (msg.what == NeuralIpc.MSG_RESULT) {
+                val d = msg.data
+                val ok = d.getBoolean(NeuralIpc.K_OK)
+                val text = if (ok) "" else (d.getString(NeuralIpc.K_ERR) ?: "failed").ifEmpty { "failed" }
+                pending.remove(d.getInt(NeuralIpc.K_ID))?.complete(text)
+            }
+            true
+        }
+    )
+
+    private val conn = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            service = Messenger(binder)
+            connected.complete(Unit)
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            // The helper process died (crash, or Android took its memory).
+            service = null
+            connected = CompletableDeferred()
+            crashes++
+            val why = "the voice helper stopped (the phone probably ran out of memory)"
+            lastError = why
+            Logs.log("Dub", "Neural voice helper process died ($crashes)")
+            val waiting = pending.values.toList()
+            pending.clear()
+            waiting.forEach { it.complete(why) }
+            if (crashes >= 2) broken = true
+        }
+
+        override fun onBindingDied(name: ComponentName?) {
+            onServiceDisconnected(name)
+        }
+    }
+
+    private suspend fun ensureConnected(): Boolean {
+        if (!bound) {
+            bound = try {
+                app.bindService(Intent(app, NeuralTtsService::class.java), conn, Context.BIND_AUTO_CREATE)
+            } catch (t: Throwable) {
+                false
+            }
+            if (!bound) {
+                broken = true
+                lastError = "could not start the voice helper"
+                return false
+            }
+        }
+        if (service != null) return true
+        val ok = withTimeoutOrNull(20_000L) { connected.await() } != null
+        if (!ok) lastError = "the voice helper did not start"
+        return ok && service != null
+    }
+
+    /** Stops the helper (frees its memory). Safe to call any time. */
+    fun unload() {
+        if (!bound) return
+        bound = false
+        service = null
+        connected = CompletableDeferred()
+        try { app.unbindService(conn) } catch (t: Throwable) {}
+        val waiting = pending.values.toList()
+        pending.clear()
+        waiting.forEach { it.complete("stopped") }
+    }
 
     /** Forget which character has which actor (called when a dub starts). */
     fun resetCast() {
@@ -53,58 +141,77 @@ class SherpaTtsVoice(private val context: Context) : DubVoice {
             maleCount = 0
             femaleCount = 0
         }
+        // a new dub gets a fresh chance
+        crashes = 0
+        broken = false
     }
 
+    // ───────────────────────── DubVoice ─────────────────────────
+
     override suspend fun isAvailable(lang: String): Boolean =
-        !broken && supports(lang) && SherpaModels.isInstalled(context)
+        !broken && supports(lang) && SherpaModels.isInstalled(app)
 
     override suspend fun synthesize(text: String, lang: String): File? =
         synthesize(text, lang, CastDirector.NARRATOR)
 
     override suspend fun synthesize(text: String, lang: String, profile: VoiceProfile): File? =
         withContext(Dispatchers.IO) {
-            // Be gentle: this runs for a long time and must not starve the
-            // video decoder. (The shared thread gets its old priority back.)
-            val old = android.os.Process.getThreadPriority(android.os.Process.myTid())
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
-            try {
-                synthesizeNow(text, lang, profile)
-            } finally {
-                android.os.Process.setThreadPriority(old)
-            }
-        }
-
-    private fun synthesizeNow(text: String, lang: String, profile: VoiceProfile): File? {
             val sid = actorFor(profile)
-            val out = File(dir, GoogleTtsVoice.key("n1", lang, "$sid|$text") + ".wav")
-            if (out.exists() && out.length() > 0) return out
+            val out = File(dir, GoogleTtsVoice.key("n2", lang, "$sid|$text") + ".wav")
+            if (out.exists() && out.length() > 0) return@withContext out
 
-            val engine = engine() ?: return null
-            val audio = synchronized(lock) {
-                try {
-                    engine.generate(text = text, sid = sid, speed = 1.0f)
-                } catch (t: Throwable) {
-                    lastError = "speaking failed: " + (t.message ?: t.javaClass.simpleName)
+            if (!ensureConnected()) return@withContext null
+            val link = service ?: return@withContext null
+
+            val id = nextId.getAndIncrement()
+            val answer = CompletableDeferred<String>()
+            pending[id] = answer
+            val data = Bundle().apply {
+                putInt(NeuralIpc.K_ID, id)
+                putString(NeuralIpc.K_DIR, SherpaModels.dir(app).path)
+                putString(NeuralIpc.K_TEXT, text)
+                putInt(NeuralIpc.K_SID, sid)
+                putString(NeuralIpc.K_OUT, out.path)
+                putString(NeuralIpc.K_LANG, lang.substringBefore('-').lowercase())
+            }
+            val msg = Message.obtain(null, NeuralIpc.MSG_SYNTH)
+            msg.data = data
+            msg.replyTo = replies
+            try {
+                link.send(msg)
+            } catch (t: Throwable) {
+                pending.remove(id)
+                lastError = "could not talk to the voice helper"
+                return@withContext null
+            }
+
+            // The first line also has to load the voice, so allow a long time.
+            val res = withTimeoutOrNull(120_000L) { answer.await() }
+            pending.remove(id)
+            when {
+                res == null -> {
+                    lastError = "the voice took too long"
                     null
                 }
-            } ?: return null
-            val samples = audio.samples
-            if (samples.isEmpty()) {
-                lastError = "the voice returned no sound"
-                return null
+                res == "stopped" -> null
+                res.isNotEmpty() -> {
+                    lastError = res
+                    Logs.log("Dub", "Neural voice error: $res")
+                    null
+                }
+                out.exists() && out.length() > 0 -> {
+                    isLoaded = true
+                    out
+                }
+                else -> {
+                    lastError = "the voice made no audio file"
+                    null
+                }
             }
-
-            val tmp = File(dir, out.name + ".part")
-            writeWav(tmp, samples, audio.sampleRate)
-            if (out.exists()) out.delete()
-            if (tmp.renameTo(out)) out else null
-    }
+        }
 
     override fun release() {
-        synchronized(lock) {
-            try { tts?.release() } catch (t: Throwable) {}
-            tts = null
-        }
+        unload()
     }
 
     // ───────────────────────── actors ─────────────────────────
@@ -123,65 +230,6 @@ class SherpaTtsVoice(private val context: Context) : DubVoice {
                 p.gender == Gender.CHILD -> HI_WOMAN[0]
                 else -> HI_WOMAN[1]
             }
-        }
-    }
-
-    // ───────────────────────── engine ─────────────────────────
-
-    private fun engine(): OfflineTts? {
-        tts?.let { return it }
-        synchronized(lock) {
-            tts?.let { return it }
-            if (broken) return null
-            return try {
-                val d = SherpaModels.dir(context)
-                val lexicons = listOf("lexicon-us-en.txt", "lexicon-zh.txt")
-                    .map { File(d, it) }
-                    .filter { it.exists() }
-                    .joinToString(",") { it.path }
-                val kokoro = OfflineTtsKokoroModelConfig(
-                    model = File(d, "model.onnx").path,
-                    voices = File(d, "voices.bin").path,
-                    tokens = File(d, "tokens.txt").path,
-                    dataDir = File(d, "espeak-ng-data").path,
-                    lexicon = lexicons,
-                    lang = "hi",
-                )
-                val threads = (Runtime.getRuntime().availableProcessors() - 2).coerceIn(1, 3)
-                val cfg = OfflineTtsConfig(
-                    model = OfflineTtsModelConfig(
-                        kokoro = kokoro,
-                        numThreads = threads,
-                        debug = false,
-                        provider = "cpu",
-                    ),
-                )
-                OfflineTts(config = cfg).also { tts = it }
-            } catch (t: Throwable) {
-                broken = true
-                lastError = "could not start: " + t.javaClass.simpleName + " " + (t.message ?: "")
-                null
-            }
-        }
-    }
-
-    /** 16-bit mono WAV. */
-    private fun writeWav(file: File, x: FloatArray, rate: Int) {
-        val data = ByteBuffer.allocate(x.size * 2).order(ByteOrder.LITTLE_ENDIAN)
-        for (v in x) {
-            val s = (v.coerceIn(-1f, 1f) * 32767f).toInt()
-            data.putShort(s.toShort())
-        }
-        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
-        val bytes = x.size * 2
-        header.put("RIFF".toByteArray()).putInt(36 + bytes).put("WAVE".toByteArray())
-        header.put("fmt ".toByteArray()).putInt(16).putShort(1).putShort(1)
-            .putInt(rate).putInt(rate * 2).putShort(2).putShort(16)
-        header.put("data".toByteArray()).putInt(bytes)
-        RandomAccessFile(file, "rw").use { f ->
-            f.setLength(0)
-            f.write(header.array())
-            f.write(data.array())
         }
     }
 
