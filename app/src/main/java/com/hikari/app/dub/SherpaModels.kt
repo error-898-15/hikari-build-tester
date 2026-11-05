@@ -24,16 +24,16 @@ import java.net.URL
  */
 object SherpaModels {
 
-    const val NAME = "kokoro-multi-lang-v1_0"
+    const val NAME = "kokoro-int8-multi-lang-v1_0"
     private const val URL_TAR =
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2"
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_0.tar.bz2"
 
     fun dir(c: Context): File = File(File(c.filesDir, "dub_models"), NAME)
 
     fun isInstalled(c: Context): Boolean {
         val d = dir(c)
         return File(d, ".ok").exists() &&
-            File(d, "model.onnx").length() > 0 &&
+            (File(d, "model.int8.onnx").length() > 0 || File(d, "model.onnx").length() > 0) &&
             File(d, "voices.bin").length() > 0 &&
             File(d, "tokens.txt").length() > 0 &&
             File(d, "espeak-ng-data").isDirectory
@@ -60,11 +60,18 @@ object SherpaModels {
             val marker = File(c.cacheDir, "$NAME.tar.bz2.done")
             val staging = File(root, "$NAME.tmp")
             var unpacking = false
+            // The first version of the neural voice used a bigger pack
+            // (about 330 MB). Free that space: it is not used any more.
+            runCatching {
+                File(root, "kokoro-multi-lang-v1_0").deleteRecursively()
+                File(c.cacheDir, "kokoro-multi-lang-v1_0.tar.bz2.part").delete()
+                File(c.cacheDir, "kokoro-multi-lang-v1_0.tar.bz2.done").delete()
+            }
             try {
                 val haveWholeFile = part.exists() && part.length() > 0 && marker.exists()
-                val needSpace = if (haveWholeFile) 700_000_000L else 1_000_000_000L
+                val needSpace = if (haveWholeFile) 300_000_000L else 500_000_000L
                 if (root.usableSpace < needSpace) {
-                    return@withContext "Not enough free space (about 1 GB is needed)."
+                    return@withContext "Not enough free space (about 500 MB is needed)."
                 }
 
                 // 1) download (with resume), skipped when the whole file is already here
@@ -79,7 +86,7 @@ object SherpaModels {
                 unpacking = false
 
                 // 3) check and switch on
-                val ok = File(staging, "model.onnx").length() > 0 &&
+                val ok = (File(staging, "model.int8.onnx").length() > 0 || File(staging, "model.onnx").length() > 0) &&
                     File(staging, "voices.bin").length() > 0 &&
                     File(staging, "tokens.txt").length() > 0 &&
                     File(staging, "espeak-ng-data").isDirectory
@@ -221,8 +228,8 @@ object SherpaModels {
                         val e = tar.nextEntry ?: break
                         var rel = e.name.replace('\\', '/')
                         if (rel.startsWith("./")) rel = rel.removePrefix("./")
-                        if (rel.startsWith("$NAME/")) rel = rel.removePrefix("$NAME/")
-                        if (rel.isEmpty() || rel == NAME) continue
+                        rel = rel.replaceFirst(Regex("^kokoro[^/]*/"), "")
+                        if (rel.isEmpty() || rel.startsWith("kokoro")) continue
                         val target = File(staging, rel)
                         // never write outside the model folder
                         if (!target.canonicalPath.startsWith(stagingPath + File.separator)) continue
