@@ -105,6 +105,7 @@ class NeuralTtsService : Service() {
         val lang = b.getString(NeuralIpc.K_LANG) ?: "hi"
         val variant = b.getInt(NeuralIpc.K_VARIANT)
 
+        if (text.none { it.isLetterOrDigit() }) error("nothing to say in this line")
         val engine = engineFor(dir, lang, variant)
         trace("speaking: actor " + sid + ", " + text.length + " characters")
         val audio = engine.generate(text = text, sid = sid, speed = 1.0f)
@@ -142,7 +143,25 @@ class NeuralTtsService : Service() {
             lexicon = lexicons,
             lang = if (variant == 1) "" else lang,
         )
-        val threads = if (variant == 2) 1 else (Runtime.getRuntime().availableProcessors() - 2).coerceIn(1, 3)
+        // The multi-language Kokoro pack splits Chinese words with a dictionary
+        // (the "dict" folder of the pack). sherpa-onnx opens it while the voice
+        // starts, and if it is not told where the folder is it tries to open
+        // "/jieba.dict.utf8", which does not exist: that is a hard native abort
+        // (no Java error), the whole helper process dies, and the player only
+        // sees "the voice helper stopped". The official sherpa-onnx Android app
+        // passes this folder, so it is set here too.
+        //
+        // It is set through reflection on purpose: Tts.kt is downloaded by the
+        // build workflow (it is not kept in this repository), so the build must
+        // compile with whichever version it fetched. If that version has no
+        // such setting, nothing happens and the build is not affected.
+        val dictDir = File(d, "dict")
+        val dictSet = if (dictDir.isDirectory) setStringField(kokoro, "DictDir", dictDir.path) else false
+        trace("dict folder: " + (if (!dictDir.isDirectory) "not in the voice pack" else if (dictSet) "set" else "this sherpa-onnx has no such setting"))
+
+        // Fewer threads = less memory (each one holds its own working buffers),
+        // and a phone that is also playing a video has little to spare.
+        val threads = if (variant == 2) 1 else (Runtime.getRuntime().availableProcessors() - 2).coerceIn(1, 2)
         trace("loading voice: " + model.name + " " + (model.length() / 1_000_000L) + " MB, way " + variant + ", threads " + threads)
         val cfg = OfflineTtsConfig(
             model = OfflineTtsModelConfig(
@@ -158,6 +177,15 @@ class NeuralTtsService : Service() {
         loadedFor = key
         return created
     }
+
+    /** Calls `set<Name>(value)` on [target] when that setting exists. Never throws. */
+    private fun setStringField(target: Any, name: String, value: String): Boolean =
+        try {
+            target.javaClass.getMethod("set$name", String::class.java).invoke(target, value)
+            true
+        } catch (t: Throwable) {
+            false
+        }
 
     private fun trace(line: String) {
         try {
