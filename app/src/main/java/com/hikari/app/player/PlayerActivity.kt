@@ -1701,6 +1701,8 @@ class PlayerActivity : ComponentActivity() {
             offsetMs = { subtitleOffsetMs },
             setOriginalVolume = { v -> runCatching { player?.volume = v } },
             onStatus = { msg -> showDubToast(msg) },
+            mediaUrl = { sources.getOrNull(currentIndex)?.url },
+            mediaHeaders = { sources.getOrNull(currentIndex)?.headers.orEmpty() },
         )
     }
 
