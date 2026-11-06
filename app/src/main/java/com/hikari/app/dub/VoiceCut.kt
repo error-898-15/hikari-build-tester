@@ -133,11 +133,8 @@ class VoiceCutProcessor : AudioProcessor {
         ring[pitchWritePos++] = midSample
         if (pitchWritePos >= ring.size) {
             pitchWritePos = 0
-            AudioGenderDetector.estimatePitchAndGender(ring, sampleRate)?.let { (f0, g) ->
-                DubVoiceCut.livePitchHz = f0
-                DubVoiceCut.liveGender = g
-                DubVoiceCut.liveUpdatedAtMs = SystemClock.elapsedRealtime()
-            }
+            // Live pitch detection was removed together with AudioGenderDetector;
+            // the voice scan (VoiceScanner) now decides man / woman instead.
         }
     }
 
