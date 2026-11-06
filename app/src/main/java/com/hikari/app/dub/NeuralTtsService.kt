@@ -29,6 +29,11 @@ internal object NeuralIpc {
     const val MSG_SCAN_PROGRESS = 4
     const val MSG_SCAN_RESULT = 5
     const val MSG_SCAN_CANCEL = 6
+    /** Listen to the voice of a video and write it down as a subtitle (speech to text). */
+    const val MSG_GEN = 7
+    const val MSG_GEN_PROGRESS = 8
+    const val MSG_GEN_RESULT = 9
+    const val MSG_GEN_CANCEL = 10
     const val K_URL = "url"
     const val K_HEADERS = "headers"
     const val K_HLS = "hls"
@@ -48,6 +53,16 @@ internal object NeuralIpc {
     const val K_SPEED = "speed"
     const val K_OUT = "out"
     const val K_VARIANT = "variant"
+    /** Subtitle writing: folder of the speech model (encoder.onnx, decoder.onnx, tokens.txt). */
+    const val K_WDIR = "wdir"
+    /** Subtitle writing: the speech-detection model file (silero_vad.onnx). */
+    const val K_VAD = "vad"
+    /** Subtitle writing: spoken language code, empty = decide by listening. */
+    const val K_LANG = "lang"
+    const val K_DURATION = "duration"
+    const val K_THREADS = "threads"
+    const val K_COUNT = "count"
+    const val K_PARTIAL = "partial"
     /** "kokoro" = the English Kokoro pack (several speakers in one model); anything else = a Piper voice. */
     const val K_KIND = "kind"
     /** Where the helper writes what it is doing, so that if it dies we know where. */
@@ -73,6 +88,9 @@ class NeuralTtsService : Service() {
     /** Voice scans that are running (id -> "stop" flag). */
     private val scans = java.util.concurrent.ConcurrentHashMap<Int, java.util.concurrent.atomic.AtomicBoolean>()
 
+    /** Subtitle writings that are running (id -> "stop" flag). */
+    private val gens = java.util.concurrent.ConcurrentHashMap<Int, java.util.concurrent.atomic.AtomicBoolean>()
+
     override fun onCreate() {
         super.onCreate()
         trace("service started")
@@ -91,6 +109,7 @@ class NeuralTtsService : Service() {
 
     override fun onDestroy() {
         for (flag in scans.values) flag.set(true)
+        for (flag in gens.values) flag.set(true)
         val t = thread
         val h = handler
         if (t != null && h != null) {
@@ -124,6 +143,11 @@ class NeuralTtsService : Service() {
             NeuralIpc.MSG_SCAN -> startScan(msg)
             NeuralIpc.MSG_SCAN_CANCEL -> {
                 val flag = scans[msg.data.getInt(NeuralIpc.K_ID)]
+                if (flag != null) flag.set(true)
+            }
+            NeuralIpc.MSG_GEN -> startGenerate(msg)
+            NeuralIpc.MSG_GEN_CANCEL -> {
+                val flag = gens[msg.data.getInt(NeuralIpc.K_ID)]
                 if (flag != null) flag.set(true)
             }
         }
@@ -226,6 +250,99 @@ class NeuralTtsService : Service() {
             }
         }
         worker.name = "voice-scan"
+        worker.isDaemon = true
+        worker.start()
+    }
+
+    /**
+     * Listens to the voice of a video and writes it down as an SRT subtitle
+     * (voice detection + Whisper, see [VoiceTranscriber]) on a thread of its
+     * own. Replies with progress messages and one final result; the subtitle
+     * text itself is written to the file named in K_OUT.
+     */
+    private fun startGenerate(msg: Message) {
+        val d = Bundle(msg.data)
+        val id = d.getInt(NeuralIpc.K_ID)
+        val reply = msg.replyTo
+        val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        gens[id] = cancelled
+        val worker = Thread {
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)
+            } catch (t: Throwable) {
+            }
+            val answer = Bundle()
+            answer.putInt(NeuralIpc.K_ID, id)
+            try {
+                val flat: Array<String> = d.getStringArray(NeuralIpc.K_HEADERS) ?: arrayOf<String>()
+                val headers = LinkedHashMap<String, String>()
+                var i = 0
+                while (i + 1 < flat.size) {
+                    headers[flat[i]] = flat[i + 1]
+                    i += 2
+                }
+                val url = d.getString(NeuralIpc.K_URL) ?: error("no video address")
+                val out = File(d.getString(NeuralIpc.K_OUT) ?: error("no output file"))
+                val modelDir = File(d.getString(NeuralIpc.K_WDIR) ?: error("no speech model folder"))
+                val vadModel = File(d.getString(NeuralIpc.K_VAD) ?: error("no speech-detection model"))
+                val progress: (Int, String) -> Unit = { pct, note ->
+                    val m = Message.obtain(null, NeuralIpc.MSG_GEN_PROGRESS)
+                    val b = Bundle()
+                    b.putInt(NeuralIpc.K_ID, id)
+                    b.putInt(NeuralIpc.K_PCT, pct)
+                    b.putString(NeuralIpc.K_NOTE, note)
+                    m.data = b
+                    try {
+                        reply?.send(m)
+                    } catch (e: Throwable) {
+                    }
+                }
+                trace("subtitle: start")
+                val outcome = VoiceTranscriber.run(
+                    ctx = applicationContext,
+                    url = url,
+                    headers = headers,
+                    hlsHint = d.getBoolean(NeuralIpc.K_HLS),
+                    durationMs = d.getLong(NeuralIpc.K_DURATION),
+                    language = d.getString(NeuralIpc.K_LANG).orEmpty(),
+                    modelDir = modelDir,
+                    vadModel = vadModel,
+                    threads = d.getInt(NeuralIpc.K_THREADS, 2).coerceIn(1, 4),
+                    cancelled = { cancelled.get() },
+                    progress = progress,
+                )
+                val srt = outcome.srt
+                if (srt != null) {
+                    out.parentFile?.mkdirs()
+                    val tmp = File(out.path + ".part")
+                    tmp.writeText(srt, Charsets.UTF_8)
+                    if (out.exists()) out.delete()
+                    if (!tmp.renameTo(out)) error("could not save the subtitle")
+                    answer.putBoolean(NeuralIpc.K_OK, true)
+                    answer.putString(NeuralIpc.K_LANG, outcome.lang)
+                    answer.putInt(NeuralIpc.K_COUNT, outcome.lines)
+                    answer.putBoolean(NeuralIpc.K_PARTIAL, outcome.partial)
+                    trace("subtitle: done, " + outcome.lines + " lines, language " + outcome.lang)
+                } else {
+                    answer.putBoolean(NeuralIpc.K_OK, false)
+                    answer.putString(NeuralIpc.K_ERR, outcome.note.ifEmpty { "no answer" })
+                    trace("subtitle: no result, " + outcome.note)
+                }
+            } catch (t: Throwable) {
+                trace("subtitle error: " + t.javaClass.simpleName + " " + (t.message ?: ""))
+                answer.putBoolean(NeuralIpc.K_OK, false)
+                answer.putString(NeuralIpc.K_ERR, t.javaClass.simpleName + ": " + (t.message ?: ""))
+            } finally {
+                gens.remove(id)
+            }
+            val done = Message.obtain(null, NeuralIpc.MSG_GEN_RESULT)
+            done.data = answer
+            try {
+                reply?.send(done)
+            } catch (e: Throwable) {
+            }
+        }
+        worker.name = "subtitle-gen"
         worker.isDaemon = true
         worker.start()
     }
