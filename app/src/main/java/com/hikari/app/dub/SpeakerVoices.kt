@@ -1,6 +1,7 @@
 package com.hikari.app.dub
 
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 /** Who is speaking, as far as the subtitle lets us tell. */
 enum class Gender { MALE, FEMALE, CHILD, NEUTRAL, UNKNOWN }
@@ -178,20 +179,36 @@ object NameGender {
 
 /**
  * The voices chosen for one subtitle: every named character gets a voice of
- * its own (same character = same voice for the whole video).
+ * its own (same character = same voice for the whole video). Unnamed lines
+ * start with a fallback plan and are upgraded in-place by [AudioGenderDetector]
+ * as original audio pitch & speaker clusters are detected.
  */
 class Cast(
     val roster: List<Pair<String, VoiceProfile>>,
-    /** Voice of every line that has no character name (decided in advance, see
-     *  [CastDirector.assign]). Keyed by the cue object itself. */
     private val anon: Map<DubCue, VoiceProfile> = emptyMap(),
 ) {
 
     private val byKey: Map<String, VoiceProfile> =
         roster.associate { (name, profile) -> CastDirector.keyOf(name) to profile }
 
+    /** Audio-detected overrides keyed by startMs|turn so they stay thread-safe. */
+    private val audioOverrides = ConcurrentHashMap<String, VoiceProfile>()
+
     /** Counts the lines handed out in live mode (no cue list to plan from). */
     private val liveTurn = java.util.concurrent.atomic.AtomicInteger(0)
+
+    private fun cueKey(cue: DubCue): String = "${cue.startMs}|${cue.turn}"
+
+    /** Updates an unnamed cue's voice profile from detected original audio pitch/cluster. */
+    fun updateFromAudio(cue: DubCue, res: AudioGenderDetector.CueVoiceResult) {
+        val profile = when (res.gender) {
+            Gender.MALE -> CastDirector.anonVoice(true, res.clusterId)
+            Gender.FEMALE -> CastDirector.anonVoice(false, res.clusterId)
+            Gender.CHILD -> CastDirector.CHILD_ANON
+            else -> CastDirector.anonVoice(res.f0Hz < 162f, res.clusterId)
+        }
+        audioOverrides[cueKey(cue)] = profile
+    }
 
     fun profileFor(cue: DubCue): VoiceProfile {
         val s = cue.speaker
@@ -199,9 +216,21 @@ class Cast(
             val p = byKey[CastDirector.keyOf(s)]
             if (p != null) return p
         }
-        // Lines with no name: a man or a woman, planned for the whole subtitle.
+        // 1) Audio-detected gender/speaker cluster override for unnamed subtitle lines
+        audioOverrides[cueKey(cue)]?.let { return it }
+
+        // 2) Real-time audio sink pitch detection (when playing live or before scan finishes)
+        val liveG = DubVoiceCut.recentGender()
+        if (liveG == Gender.MALE || liveG == Gender.FEMALE) {
+            val n = liveTurn.get()
+            return CastDirector.anonVoice(liveG == Gender.MALE, n)
+        } else if (liveG == Gender.CHILD) {
+            return CastDirector.CHILD_ANON
+        }
+
+        // 3) Fallback planned voice when audio hasn't been scanned yet
         anon[cue]?.let { return it }
-        // Live captions (no list to plan from): man and woman take turns.
+
         val n = liveTurn.getAndIncrement()
         return CastDirector.anonVoice(n % 2 == 1, n / 2)
     }
@@ -233,18 +262,19 @@ object CastDirector {
     val FEMALE_B = VoiceProfile(Gender.FEMALE, 2.0f, 1.03f, "Voice C")
     val MALE_B = VoiceProfile(Gender.MALE, -4.5f, 1.04f, "Voice D")
 
+    /** Unnamed child voice when original audio pitch is > 275 Hz. */
+    val CHILD_ANON = VoiceProfile(Gender.CHILD, 5.5f, 1.06f, "Voice C")
+
     private val ANON_FEMALE = listOf(NARRATOR, FEMALE_B)
     private val ANON_MALE = listOf(SECOND, MALE_B)
 
     /** The [k]-th unnamed woman / man voice (old artist first, then the new one). */
     fun anonVoice(male: Boolean, k: Int): VoiceProfile =
-        (if (male) ANON_MALE else ANON_FEMALE)[k % 2]
+        (if (male) ANON_MALE else ANON_FEMALE)[(k and Int.MAX_VALUE) % 2]
 
     /** A pause this long after a finished sentence is taken as someone else talking. */
     private const val TURN_GAP_MS = 600L
 
-    // The first male is a normal deep voice, the next ones differ a little in
-    // depth and speed so two men in one scene never sound identical.
     private val MALE_PITCH = floatArrayOf(-5.0f, -3.5f, -6.5f, -2.5f, -5.8f, -4.2f)
     private val MALE_TEMPO = floatArrayOf(1.00f, 1.04f, 0.95f, 1.06f, 0.97f, 1.02f)
     private val FEMALE_PITCH = floatArrayOf(1.0f, 2.5f, 0.3f, 3.5f, 1.8f, 3.0f)
@@ -271,7 +301,6 @@ object CastDirector {
 
             var g = NameGender.guess(name)
             if (g == Gender.UNKNOWN) {
-                // Cannot tell: keep the cast balanced so neighbours differ.
                 g = if (males <= females) Gender.MALE else Gender.FEMALE
             }
             val profile = when (g) {
@@ -298,25 +327,16 @@ object CastDirector {
         return last in ".!?\u3002\uFF01\uFF1F\u061F"
     }
 
-    /**
-     * Subtitles usually do not say who talks. The speaker cannot be known, so
-     * every new "turn" (a pause after a finished sentence, or the second line
-     * of a "- Hi / - Hello" exchange) gets a man or a woman at random. The
-     * draw is repeatable (same subtitle = same voices), it never gives the
-     * same sex three turns in a row, and the answer in a "- Hi / - Hello"
-     * exchange is always the other sex. A wrong guess (a man's line read by a
-     * woman) is accepted; what matters is that both kinds of voice are heard.
-     */
     private fun planUnnamed(cues: List<DubCue>): Map<DubCue, VoiceProfile> {
         val out = java.util.IdentityHashMap<DubCue, VoiceProfile>()
         val rnd = java.util.Random(31L * cues.size + (cues.firstOrNull()?.startMs ?: 0L))
         var male = false
         var run = 0
-        val taken = intArrayOf(0, 0)          // turns given so far: [women, men]
+        val taken = intArrayOf(0, 0)
         var current = NARRATOR
         var prev: DubCue? = null
         for (cue in cues) {
-            if (cue.speaker != null) {        // a named character has its own voice
+            if (cue.speaker != null) {
                 prev = cue
                 continue
             }
