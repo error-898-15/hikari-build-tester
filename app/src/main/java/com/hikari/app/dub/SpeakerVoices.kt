@@ -1,7 +1,6 @@
 package com.hikari.app.dub
 
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 
 /** Who is speaking, as far as the subtitle lets us tell. */
 enum class Gender { MALE, FEMALE, CHILD, NEUTRAL, UNKNOWN }
@@ -179,36 +178,20 @@ object NameGender {
 
 /**
  * The voices chosen for one subtitle: every named character gets a voice of
- * its own (same character = same voice for the whole video). Unnamed lines
- * start with a fallback plan and are upgraded in-place by [AudioGenderDetector]
- * as original audio pitch & speaker clusters are detected.
+ * its own (same character = same voice for the whole video).
  */
 class Cast(
     val roster: List<Pair<String, VoiceProfile>>,
+    /** Voice of every line that has no character name (decided in advance, see
+     *  [CastDirector.assign]). Keyed by the cue object itself. */
     private val anon: Map<DubCue, VoiceProfile> = emptyMap(),
 ) {
 
     private val byKey: Map<String, VoiceProfile> =
         roster.associate { (name, profile) -> CastDirector.keyOf(name) to profile }
 
-    /** Audio-detected overrides keyed by startMs|turn so they stay thread-safe. */
-    private val audioOverrides = ConcurrentHashMap<String, VoiceProfile>()
-
     /** Counts the lines handed out in live mode (no cue list to plan from). */
     private val liveTurn = java.util.concurrent.atomic.AtomicInteger(0)
-
-    private fun cueKey(cue: DubCue): String = "${cue.startMs}|${cue.turn}"
-
-    /** Updates an unnamed cue's voice profile from detected original audio pitch/cluster. */
-    fun updateFromAudio(cue: DubCue, res: AudioGenderDetector.CueVoiceResult) {
-        val profile = when (res.gender) {
-            Gender.MALE -> CastDirector.anonVoice(true, res.clusterId)
-            Gender.FEMALE -> CastDirector.anonVoice(false, res.clusterId)
-            Gender.CHILD -> CastDirector.CHILD_ANON
-            else -> CastDirector.anonVoice(res.f0Hz < 162f, res.clusterId)
-        }
-        audioOverrides[cueKey(cue)] = profile
-    }
 
     fun profileFor(cue: DubCue): VoiceProfile {
         val s = cue.speaker
@@ -216,21 +199,9 @@ class Cast(
             val p = byKey[CastDirector.keyOf(s)]
             if (p != null) return p
         }
-        // 1) Audio-detected gender/speaker cluster override for unnamed subtitle lines
-        audioOverrides[cueKey(cue)]?.let { return it }
-
-        // 2) Real-time audio sink pitch detection (when playing live or before scan finishes)
-        val liveG = DubVoiceCut.recentGender()
-        if (liveG == Gender.MALE || liveG == Gender.FEMALE) {
-            val n = liveTurn.get()
-            return CastDirector.anonVoice(liveG == Gender.MALE, n)
-        } else if (liveG == Gender.CHILD) {
-            return CastDirector.CHILD_ANON
-        }
-
-        // 3) Fallback planned voice when audio hasn't been scanned yet
+        // Lines with no name: a man or a woman, planned for the whole subtitle.
         anon[cue]?.let { return it }
-
+        // Live captions (no list to plan from): man and woman take turns.
         val n = liveTurn.getAndIncrement()
         return CastDirector.anonVoice(n % 2 == 1, n / 2)
     }
@@ -262,19 +233,18 @@ object CastDirector {
     val FEMALE_B = VoiceProfile(Gender.FEMALE, 2.0f, 1.03f, "Voice C")
     val MALE_B = VoiceProfile(Gender.MALE, -4.5f, 1.04f, "Voice D")
 
-    /** Unnamed child voice when original audio pitch is > 275 Hz. */
-    val CHILD_ANON = VoiceProfile(Gender.CHILD, 5.5f, 1.06f, "Voice C")
-
     private val ANON_FEMALE = listOf(NARRATOR, FEMALE_B)
     private val ANON_MALE = listOf(SECOND, MALE_B)
 
     /** The [k]-th unnamed woman / man voice (old artist first, then the new one). */
     fun anonVoice(male: Boolean, k: Int): VoiceProfile =
-        (if (male) ANON_MALE else ANON_FEMALE)[(k and Int.MAX_VALUE) % 2]
+        (if (male) ANON_MALE else ANON_FEMALE)[k % 2]
 
     /** A pause this long after a finished sentence is taken as someone else talking. */
     private const val TURN_GAP_MS = 600L
 
+    // The first male is a normal deep voice, the next ones differ a little in
+    // depth and speed so two men in one scene never sound identical.
     private val MALE_PITCH = floatArrayOf(-5.0f, -3.5f, -6.5f, -2.5f, -5.8f, -4.2f)
     private val MALE_TEMPO = floatArrayOf(1.00f, 1.04f, 0.95f, 1.06f, 0.97f, 1.02f)
     private val FEMALE_PITCH = floatArrayOf(1.0f, 2.5f, 0.3f, 3.5f, 1.8f, 3.0f)
@@ -290,7 +260,15 @@ object CastDirector {
             "",
         )
 
-    fun assign(cues: List<DubCue>): Cast {
+    /**
+     * [scan] = what listening to the ORIGINAL voices found (see
+     * [VoiceScanResult]); null = no scan, the old name / random rules only.
+     * With a scan, a named character whose name does not show the sex gets
+     * the sex of its real voice, and every line without a name gets the voice
+     * of the real speaker (same person = same dub voice, a man's line is
+     * read by a man).
+     */
+    fun assign(cues: List<DubCue>, scan: VoiceScanResult? = null): Cast {
         val seen = LinkedHashMap<String, Pair<String, VoiceProfile>>()
         var males = 0
         var females = 0
@@ -300,7 +278,9 @@ object CastDirector {
             if (seen.containsKey(key)) continue
 
             var g = NameGender.guess(name)
+            if (g == Gender.UNKNOWN && scan != null) g = scannedSex(cues, name, scan)
             if (g == Gender.UNKNOWN) {
+                // Cannot tell: keep the cast balanced so neighbours differ.
                 g = if (males <= females) Gender.MALE else Gender.FEMALE
             }
             val profile = when (g) {
@@ -319,7 +299,84 @@ object CastDirector {
             }
             seen[key] = name to profile
         }
-        return Cast(seen.values.toList(), planUnnamed(cues))
+        val plan = planUnnamed(cues)
+        if (scan != null) overrideFromScan(cues, scan, plan)
+        return Cast(seen.values.toList(), plan)
+    }
+
+    /** The sex of the real voice behind a named character (most lines win), or UNKNOWN. */
+    private fun scannedSex(cues: List<DubCue>, name: String, scan: VoiceScanResult): Gender {
+        val key = keyOf(name)
+        var men = 0
+        var women = 0
+        for (i in cues.indices) {
+            val s = cues[i].speaker ?: continue
+            if (keyOf(s) != key) continue
+            when (scan.genderOf(i)) {
+                Gender.MALE -> men++
+                Gender.FEMALE -> women++
+                else -> {}
+            }
+        }
+        return when {
+            men > women -> Gender.MALE
+            women > men -> Gender.FEMALE
+            else -> Gender.UNKNOWN
+        }
+    }
+
+    /**
+     * Replaces the random guess of [plan] by the real voices found by the scan.
+     * Every scanned person gets a voice of its own (a man the next free man
+     * look, a woman the next free woman look); a line whose person could not be
+     * told but whose sex is known gets the main voice of that sex; a line with
+     * neither keeps the old random guess.
+     */
+    private fun overrideFromScan(
+        cues: List<DubCue>,
+        scan: VoiceScanResult,
+        plan: MutableMap<DubCue, VoiceProfile>,
+    ) {
+        val byVoice = HashMap<Int, VoiceProfile>()
+        var males = 0
+        var females = 0
+        val mainOf = HashMap<Gender, VoiceProfile>()
+
+        fun profileOf(voice: Int, g: Gender): VoiceProfile {
+            val have = byVoice[voice]
+            if (have != null) return have
+            val p = if (g == Gender.MALE) {
+                val i = males % MALE_PITCH.size
+                males++
+                VoiceProfile(Gender.MALE, MALE_PITCH[i], MALE_TEMPO[i], "Speaker " + (voice + 1))
+            } else {
+                val i = females % FEMALE_PITCH.size
+                females++
+                VoiceProfile(Gender.FEMALE, FEMALE_PITCH[i], FEMALE_TEMPO[i], "Speaker " + (voice + 1))
+            }
+            byVoice[voice] = p
+            if (!mainOf.containsKey(g)) mainOf[g] = p
+            return p
+        }
+
+        // first the people the scan could tell apart ...
+        for (i in cues.indices) {
+            val v = scan.voiceOf(i)
+            val g = scan.genderOf(i)
+            if (v >= 0 && (g == Gender.MALE || g == Gender.FEMALE) && cues[i].speaker == null) {
+                plan[cues[i]] = profileOf(v, g)
+            }
+        }
+        // ... then the lines where only the sex is known
+        for (i in cues.indices) {
+            val v = scan.voiceOf(i)
+            val g = scan.genderOf(i)
+            if (cues[i].speaker != null) continue
+            if (v < 0 && (g == Gender.MALE || g == Gender.FEMALE)) {
+                val main = mainOf[g] ?: profileOf(-1 - (if (g == Gender.MALE) 0 else 1), g)
+                plan[cues[i]] = main
+            }
+        }
     }
 
     private fun endsSentence(t: String): Boolean {
@@ -327,16 +384,25 @@ object CastDirector {
         return last in ".!?\u3002\uFF01\uFF1F\u061F"
     }
 
-    private fun planUnnamed(cues: List<DubCue>): Map<DubCue, VoiceProfile> {
+    /**
+     * Subtitles usually do not say who talks. The speaker cannot be known, so
+     * every new "turn" (a pause after a finished sentence, or the second line
+     * of a "- Hi / - Hello" exchange) gets a man or a woman at random. The
+     * draw is repeatable (same subtitle = same voices), it never gives the
+     * same sex three turns in a row, and the answer in a "- Hi / - Hello"
+     * exchange is always the other sex. A wrong guess (a man's line read by a
+     * woman) is accepted; what matters is that both kinds of voice are heard.
+     */
+    private fun planUnnamed(cues: List<DubCue>): MutableMap<DubCue, VoiceProfile> {
         val out = java.util.IdentityHashMap<DubCue, VoiceProfile>()
         val rnd = java.util.Random(31L * cues.size + (cues.firstOrNull()?.startMs ?: 0L))
         var male = false
         var run = 0
-        val taken = intArrayOf(0, 0)
+        val taken = intArrayOf(0, 0)          // turns given so far: [women, men]
         var current = NARRATOR
         var prev: DubCue? = null
         for (cue in cues) {
-            if (cue.speaker != null) {
+            if (cue.speaker != null) {        // a named character has its own voice
                 prev = cue
                 continue
             }
