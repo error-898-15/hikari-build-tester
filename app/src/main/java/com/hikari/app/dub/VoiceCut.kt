@@ -1,5 +1,6 @@
 package com.hikari.app.dub
 
+import android.os.SystemClock
 import androidx.media3.common.C
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.util.UnstableApi
@@ -10,49 +11,31 @@ import kotlin.math.exp
 
 /**
  * Switchboard between the dub engine and the audio stage of the player.
- *
- * The dub engine only writes [target] ("how much of the original dialogue
- * should be removed right now", 0 = none, 1 = all of it). The audio stage
- * ([VoiceCutProcessor], living inside the ExoPlayer audio sink) reads it and
- * reports back through [works] whether it is able to do the job for the
- * video that is playing.
  */
 object DubVoiceCut {
     /** 0f..1f, written by the dub engine (main thread), read by the audio thread. */
     @Volatile
     var target: Float = 0f
 
-    /**
-     * True when the sound that reaches the player's audio stage is stereo or
-     * surround AND has real stereo content, so the dialogue can be taken out
-     * while the music and the sound effects stay. False for mono sound (and
-     * for stereo that is really mono): there the dub engine falls back to
-     * lowering the whole original sound, as before.
-     */
     @Volatile
     var works: Boolean = false
+
+    /** Latest gender detected from the live original audio stream before dialogue cut. */
+    @Volatile
+    var liveGender: Gender = Gender.UNKNOWN
+
+    @Volatile
+    var livePitchHz: Float = 0f
+
+    @Volatile
+    var liveUpdatedAtMs: Long = 0L
+
+    fun recentGender(maxAgeMs: Long = 3_500L): Gender {
+        if (SystemClock.elapsedRealtime() - liveUpdatedAtMs > maxAgeMs) return Gender.UNKNOWN
+        return liveGender
+    }
 }
 
-/**
- * Removes the original DIALOGUE from the movie's sound while the music and the
- * sound effects keep playing.
- *
- * How (no AI, no internet, runs inside the audio sink on every device):
- *
- *  - Stereo: dialogue is almost always mixed into the CENTER (same level in
- *    the left and the right channel), while music and effects are spread
- *    wide. So the "center" part (L+R)/2 of the voice band (everything above
- *    [LOW_CUT_HZ]) is subtracted from both channels. The bass below
- *    [LOW_CUT_HZ] is left alone, so the kick drum and the rumble of
- *    explosions do not disappear.
- *  - 5.1 / 7.1: dialogue lives in the CENTER channel (index 2), so that
- *    channel is turned down. Left, right, surround and LFE are untouched.
- *  - Mono: nothing can be separated, the stage stays out of the way (and
- *    [DubVoiceCut.works] is false so the engine lowers the volume instead).
- *
- * The amount is smoothed (about 30 ms) so switching never clicks. With the
- * amount at 0 the sound passes through bit-exact.
- */
 @UnstableApi
 class VoiceCutProcessor : AudioProcessor {
 
@@ -66,24 +49,24 @@ class VoiceCutProcessor : AudioProcessor {
     private var isFloat = false
     private var sampleRate = 48000
 
-    // smoothing and low-pass coefficients (set in configure)
     private var smooth = 0.001f
     private var lpAlpha = 0.03f
 
-    // the live (smoothed) amount
     private var cur = 0f
 
-    // two cascaded one-pole low-passes per channel (the part that is kept as it is)
     private var a1L = 0f
     private var a2L = 0f
     private var a1R = 0f
     private var a2R = 0f
 
-    // how "wide" the stereo picture is (long-term), to spot mono hidden in stereo
     private var wMid = 0.0
     private var wSide = 0.0
     private var activeFrames = 0.0
     private var monoLike = false
+
+    // Ring buffer for real-time original voice pitch analysis (~250 ms window)
+    private var pitchRing = FloatArray(12000)
+    private var pitchWritePos = 0
 
     override fun configure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
         val enc = inputAudioFormat.encoding
@@ -97,6 +80,8 @@ class VoiceCutProcessor : AudioProcessor {
         sampleRate = if (inputAudioFormat.sampleRate > 0) inputAudioFormat.sampleRate else 48000
         smooth = (1.0 - exp(-1.0 / (0.030 * sampleRate))).toFloat()
         lpAlpha = (1.0 - exp(-2.0 * PI * LOW_CUT_HZ / sampleRate)).toFloat()
+        pitchRing = FloatArray((sampleRate / 4).coerceAtLeast(4000))
+        pitchWritePos = 0
         resetState()
         wMid = 0.0
         wSide = 0.0
@@ -125,7 +110,6 @@ class VoiceCutProcessor : AudioProcessor {
         } else {
             processSurround(inputBuffer, dst, size)
         }
-        // a few stray bytes that do not make a whole frame are passed on unchanged
         while (inputBuffer.hasRemaining()) dst.put(inputBuffer.get())
         dst.flip()
         pending = dst
@@ -140,6 +124,20 @@ class VoiceCutProcessor : AudioProcessor {
         } else {
             val s = (v * 32768f).toInt().coerceIn(-32768, 32767)
             b.putShort(s.toShort())
+        }
+    }
+
+    private fun feedPitchSample(midSample: Float) {
+        val ring = pitchRing
+        if (ring.isEmpty()) return
+        ring[pitchWritePos++] = midSample
+        if (pitchWritePos >= ring.size) {
+            pitchWritePos = 0
+            AudioGenderDetector.estimatePitchAndGender(ring, sampleRate)?.let { (f0, g) ->
+                DubVoiceCut.livePitchHz = f0
+                DubVoiceCut.liveGender = g
+                DubVoiceCut.liveUpdatedAtMs = SystemClock.elapsedRealtime()
+            }
         }
     }
 
@@ -167,6 +165,7 @@ class VoiceCutProcessor : AudioProcessor {
             val hR = r - lo2R
             val mid = (hL + hR) * 0.5f
             val side = (hL - hR) * 0.5f
+            feedPitchSample(mid)
             sumMid += (mid * mid).toDouble()
             sumSide += (side * side).toDouble()
             k += (tgt - k) * sm
@@ -192,18 +191,13 @@ class VoiceCutProcessor : AudioProcessor {
             val keep = 1f - k
             for (c in 0 until channels) {
                 val v = readSample(src)
+                if (c == 2) feedPitchSample(v)
                 writeSample(dst, if (c == 2) v * keep else v)
             }
         }
         cur = if (k < 0.0005f && tgt == 0f) 0f else k
     }
 
-    /**
-     * Long-term side/mid energy of the voice band. A picture that stays
-     * almost flat for several seconds of real sound is mono in disguise
-     * (both channels carry the same thing): taking the "center" out of it
-     * would take out everything, so the engine is told it cannot work here.
-     */
     private fun measureWidth(frames: Int, sumMid: Double, sumSide: Double) {
         if (frames <= 0) return
         val dec = exp(-(frames.toDouble() / sampleRate) / WIDTH_TAU_S)
@@ -233,6 +227,7 @@ class VoiceCutProcessor : AudioProcessor {
     override fun flush() {
         pending = AudioProcessor.EMPTY_BUFFER
         inputEnded = false
+        pitchWritePos = 0
         resetState()
     }
 
@@ -253,7 +248,6 @@ class VoiceCutProcessor : AudioProcessor {
     }
 
     private companion object {
-        /** Everything below this stays untouched (bass, kick drum, explosions). */
         const val LOW_CUT_HZ = 250.0
         const val WIDTH_TAU_S = 20.0
         const val MIN_ACTIVE_S = 6.0
