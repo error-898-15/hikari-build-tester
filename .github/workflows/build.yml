@@ -122,6 +122,11 @@ jobs:
               echo "::warning::sherpa-onnx source for '${PAT}' not found - the voice scan will use pitch only"
             fi
           done
+          # Speaker.kt of this sherpa-onnx release uses SpeakerEmbeddingExtractorConfig
+          # but does not define it. Add it if no file defines it (needed to compile).
+          if [ -f app/src/main/java/com/k2fsa/sherpa/onnx/Speaker.kt ] && ! grep -rq "class SpeakerEmbeddingExtractorConfig" app/src/main/java/com/k2fsa/sherpa/onnx/; then
+            printf '\ndata class SpeakerEmbeddingExtractorConfig(\n    var model: String = "",\n    var numThreads: Int = 1,\n    var debug: Boolean = false,\n    var provider: String = "cpu",\n)\n' >> app/src/main/java/com/k2fsa/sherpa/onnx/Speaker.kt
+          fi
           if ! grep -q "commons-compress" app/build.gradle.kts; then
             printf '\ndependencies {\n    implementation("org.apache.commons:commons-compress:1.27.1")\n}\n' >> app/build.gradle.kts
           fi
