@@ -73,6 +73,7 @@ object DubDialog {
         onUpload: () -> Unit,
         onStop: () -> Unit,
         onStart: (lang: String, mode: VoiceMode, duck: Float, multi: Boolean) -> Unit,
+        onGenerate: (() -> Unit)? = null,
     ) {
         val d = activity.resources.displayMetrics.density
         fun pad(v: Int) = (v * d).toInt()
@@ -113,6 +114,13 @@ object DubDialog {
                     root.addView(note(I18n.t("This subtitle is inside the video, so each line is read when it appears on screen.")))
                 }
             }
+        }
+
+        // No usable subtitle: the voice of the video can write one.
+        if (!canStart && onGenerate != null) {
+            root.addView(
+                note(I18n.t("No subtitle for this video? Tap \"Make subtitle from voice\": the app listens to the sound of the video and writes the subtitle, then you can dub it."))
+            )
         }
 
         // Which characters the subtitle names (only when its text is available).
@@ -223,6 +231,8 @@ object DubDialog {
                     }
                 }
             }
+        } else if (onGenerate != null) {
+            builder.setPositiveButton(I18n.t("Make subtitle from voice")) { _, _ -> onGenerate.invoke() }
         }
         builder.show()
     }
