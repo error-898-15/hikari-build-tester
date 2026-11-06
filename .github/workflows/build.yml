@@ -109,6 +109,18 @@ jobs:
           if [ -z "$TTS_KT" ]; then echo "::error::sherpa-onnx Tts.kt not found"; exit 1; fi
           mkdir -p app/src/main/java/com/k2fsa/sherpa/onnx
           cp "$TTS_KT" app/src/main/java/com/k2fsa/sherpa/onnx/Tts.kt
+          # Writing a subtitle from the voice of a video (Whisper speech-to-text +
+          # Silero voice detection) needs the OfflineRecognizer / Vad classes of the
+          # same release. The files of the Kotlin API use each other, so the whole
+          # folder is copied. The app reaches them by reflection, so a missing file
+          # only switches that one feature off and never breaks the build.
+          KAPI=$(dirname "$TTS_KT")
+          cp "$KAPI"/*.kt app/src/main/java/com/k2fsa/sherpa/onnx/
+          for NEED in OfflineRecognizer.kt OfflineStream.kt Vad.kt; do
+            if [ ! -f "app/src/main/java/com/k2fsa/sherpa/onnx/$NEED" ]; then
+              echo "::warning::sherpa-onnx $NEED not found - subtitle from voice will not work"
+            fi
+          done
           # The voice scan (who speaks each line, man or woman) uses the speaker
           # fingerprint classes of the same sherpa-onnx release. They are reached
           # by reflection, so if they cannot be found this is only a warning: the
