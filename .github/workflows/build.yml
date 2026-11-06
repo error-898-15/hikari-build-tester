@@ -115,16 +115,8 @@ jobs:
               cp "$EXTRA_PATH" "app/src/main/java/com/k2fsa/sherpa/onnx/$extra_kt"
             fi
           done
-          if [ -f app/src/main/java/com/k2fsa/sherpa/onnx/Speaker.kt ] && ! grep -q "class SpeakerEmbeddingExtractorConfig" app/src/main/java/com/k2fsa/sherpa/onnx/Speaker.kt; then
-            cat << 'EOF' >> app/src/main/java/com/k2fsa/sherpa/onnx/Speaker.kt
-
-data class SpeakerEmbeddingExtractorConfig(
-    var model: String = "",
-    var numThreads: Int = 1,
-    var debug: Boolean = false,
-    var provider: String = "cpu",
-)
-EOF
+          if [ -f app/src/main/java/com/k2fsa/sherpa/onnx/Speaker.kt ] && ! grep -rq "class SpeakerEmbeddingExtractorConfig" app/src/main/java/com/k2fsa/sherpa/onnx/; then
+            printf '\ndata class SpeakerEmbeddingExtractorConfig(\n    var model: String = "",\n    var numThreads: Int = 1,\n    var debug: Boolean = false,\n    var provider: String = "cpu",\n)\n' >> app/src/main/java/com/k2fsa/sherpa/onnx/Speaker.kt
           fi
           if ! grep -q "commons-compress" app/build.gradle.kts; then
             printf '\ndependencies {\n    implementation("org.apache.commons:commons-compress:1.27.1")\n}\n' >> app/build.gradle.kts
