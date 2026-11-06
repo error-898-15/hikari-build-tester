@@ -109,6 +109,12 @@ jobs:
           if [ -z "$TTS_KT" ]; then echo "::error::sherpa-onnx Tts.kt not found"; exit 1; fi
           mkdir -p app/src/main/java/com/k2fsa/sherpa/onnx
           cp "$TTS_KT" app/src/main/java/com/k2fsa/sherpa/onnx/Tts.kt
+          for extra_kt in Speaker.kt OnlineStream.kt; do
+            EXTRA_PATH=$(find "$WORK/src" -name "$extra_kt" -path "*kotlin-api*" | head -n1)
+            if [ -n "$EXTRA_PATH" ]; then
+              cp "$EXTRA_PATH" "app/src/main/java/com/k2fsa/sherpa/onnx/$extra_kt"
+            fi
+          done
           if ! grep -q "commons-compress" app/build.gradle.kts; then
             printf '\ndependencies {\n    implementation("org.apache.commons:commons-compress:1.27.1")\n}\n' >> app/build.gradle.kts
           fi
