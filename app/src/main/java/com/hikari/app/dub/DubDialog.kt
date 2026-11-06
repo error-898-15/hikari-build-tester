@@ -34,6 +34,9 @@ object DubPrefs {
     /** Own voice for every character + edited audio (on by default). */
     fun smart(c: Context): Boolean = p(c).getBoolean("smart", true)
     fun saveSmart(c: Context, v: Boolean) { p(c).edit().putBoolean("smart", v).apply() }
+    /** Listen to the ORIGINAL voices first, to tell men from women and to find the characters (on by default). */
+    fun scan(c: Context): Boolean = p(c).getBoolean("scan", true)
+    fun saveScan(c: Context, v: Boolean) { p(c).edit().putBoolean("scan", v).apply() }
     fun save(c: Context, lang: String, mode: VoiceMode, duck: Float) {
         p(c).edit().putString("lang", lang).putString("mode", mode.name).putFloat("duck2", duck).apply()
     }
@@ -176,6 +179,14 @@ object DubDialog {
         }
         root.addView(smartBox)
 
+        // 6) listen to the original voices (man / woman and who is who)
+        val scanBox = CheckBox(activity).apply {
+            text = I18n.t("Listen to the original voices first (tells men from women; takes about 2 minutes, downloads a ~40 MB model once)")
+            isChecked = DubPrefs.scan(activity)
+            setPadding(0, pad(8), 0, 0)
+        }
+        root.addView(scanBox)
+
         val builder = AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle(I18n.t("Dub audio"))
             .setView(root)
@@ -192,6 +203,7 @@ object DubDialog {
                 val multi = smartBox.isChecked
                 DubPrefs.save(activity, lang, mode, duck)
                 DubPrefs.saveSmart(activity, multi)
+                DubPrefs.saveScan(activity, scanBox.isChecked)
                 val isHindi = lang.substringBefore('-').equals("hi", ignoreCase = true)
                 val isEnglish = lang.substringBefore('-').equals("en", ignoreCase = true)
                 when {
