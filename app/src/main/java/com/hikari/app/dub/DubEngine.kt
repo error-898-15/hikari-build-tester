@@ -140,8 +140,6 @@ class DubEngine(
         duckVolume: Float,
         multi: Boolean = true,
         live: Boolean = false,
-        /** What listening to the original voices found (who speaks each line, man or woman); null = not scanned. */
-        scan: VoiceScanResult? = null,
     ) {
         stop()
         if (cues.isEmpty() && !live) {
@@ -170,7 +168,7 @@ class DubEngine(
         empty.clear()
         doneNoticeShown = false
         runCatching { DubCache.trim(dir, 300L * 1024 * 1024) }
-        this.cast = if (smart && !live) CastDirector.assign(cues, scan) else Cast(emptyList())
+        this.cast = if (smart && !live) CastDirector.assign(cues) else Cast(emptyList())
         activeLang = lang
         failureNoticeShown = false
         spokenIdx = -1
@@ -583,15 +581,18 @@ class DubEngine(
         // Give the line its character's voice. Any problem => the plain clip.
         // The neural voice says by itself how much pitch change its actor needs.
         val fx = if (fromNeural) neural.fxFor(profile) else profile
+        // A cloned voice (Myira, Kyra) must reach the listener exactly as cloned: the editor
+        // then leaves its pitch, speed and tone alone (see DubFx.process).
+        val faithful = fromNeural && neural.keepsOwnVoice(profile)
         val question = isQuestion(spoken)
         val name = GoogleTtsVoice.key(
             "fx", lang,
             rawClip.name + "|" + fx.key + "|" + cue.emotion.name + "|" + question + "|e3|" +
-                (fitMs / 100L) + "|" + fromNeural,
+                (fitMs / 100L) + "|" + fromNeural + "|" + faithful,
         ) + ".wav"
         val out = File(dir, name)
         if (out.exists() && out.length() > 0) return out
-        return if (DubFx.process(rawClip, out, fx, cue.emotion, fitMs, question)) out else rawClip
+        return if (DubFx.process(rawClip, out, fx, cue.emotion, fitMs, question, faithful)) out else rawClip
     }
 
     /** A spoken line that ends with a question mark (the voice rises at the end). */
