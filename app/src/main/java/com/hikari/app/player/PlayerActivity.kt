@@ -1701,6 +1701,8 @@ class PlayerActivity : ComponentActivity() {
             offsetMs = { subtitleOffsetMs },
             setOriginalVolume = { v -> runCatching { player?.volume = v } },
             onStatus = { msg -> showDubToast(msg) },
+            holdVideo = { runCatching { player?.pause() } },
+            releaseVideo = { runCatching { player?.play() } },
         )
     }
 
