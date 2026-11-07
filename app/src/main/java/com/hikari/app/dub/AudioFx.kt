@@ -50,6 +50,11 @@ internal object DubCache {
  *
  * Pitch shift = time-stretch + resample. Resampling moves the formants along
  * with the pitch, so a lowered voice really sounds like a bigger speaker.
+ *
+ * FAITHFUL clips (cloned voices, see [process]) skip steps 3 entirely: the voice
+ * reaches the listener with exactly the timbre, pitch and speed the cloning
+ * model gave it. Only 2, 4 (speed-up without pitch change, and only when the
+ * line is too long for its slot), 5 and 6 are done.
  */
 internal object DubFx {
 
@@ -81,6 +86,9 @@ internal object DubFx {
         val whisper: Boolean = false,
     )
 
+    /** No acting at all: used for faithful (cloned) clips. */
+    private val PLAIN_MOOD = Mood(0.0, 1.0, 0.0)
+
     private const val TARGET_RMS = 0.11f
     private const val MAX_FIT_SPEEDUP = 1.45
     /** Syllable-like rate of the small pitch bounce, in Hz. */
@@ -94,6 +102,11 @@ internal object DubFx {
      *
      * [question] = the spoken text ends with a question mark: the pitch rises
      * at the end, as a person's voice does.
+     *
+     * [faithful] = the clip is a CLONED voice and must keep its own timbre: no pitch
+     * change, no speed change, no mood effects. The silence is trimmed, a line that is
+     * too long for its slot is sped up WITHOUT moving the pitch, the loudness is evened
+     * out and the edges are faded. Nothing else.
      */
     fun process(
         src: File,
@@ -102,6 +115,7 @@ internal object DubFx {
         emotion: Emotion,
         fitMs: Long,
         question: Boolean = false,
+        faithful: Boolean = false,
     ): Boolean {
         return try {
             val pcm = decode(src) ?: return false
@@ -110,29 +124,40 @@ internal object DubFx {
 
             var x = trimSilence(pcm.samples, rate)
 
-            val mood = moodOf(emotion)
-            val semis = (profile.semitones + mood.semitones).coerceIn(-9.0, 8.0)
-            val ratio = 2.0.pow(semis / 12.0)
+            val mood: Mood
+            if (faithful) {
+                mood = PLAIN_MOOD
+                val clipMs = x.size * 1000.0 / rate
+                if (fitMs > 0L && clipMs > fitMs) {
+                    val speedUp = min(clipMs / fitMs, MAX_FIT_SPEEDUP)
+                    if (speedUp > 1.02) x = wsola(x, speedUp, rate)
+                }
+                if (x.size < rate / 20) return false
+            } else {
+                mood = moodOf(emotion)
+                val semis = (profile.semitones + mood.semitones).coerceIn(-9.0, 8.0)
+                val ratio = 2.0.pow(semis / 12.0)
 
-            // Speed: character speed x mood, then whatever is needed to fit the time slot.
-            var tempo = profile.tempo.toDouble() * mood.tempo
-            val clipMs = x.size * 1000.0 / rate
-            val afterMs = clipMs / tempo
-            if (fitMs > 0L && afterMs > fitMs) {
-                tempo *= min(afterMs / fitMs, MAX_FIT_SPEEDUP)
+                // Speed: character speed x mood, then whatever is needed to fit the time slot.
+                var tempo = profile.tempo.toDouble() * mood.tempo
+                val clipMs = x.size * 1000.0 / rate
+                val afterMs = clipMs / tempo
+                if (fitMs > 0L && afterMs > fitMs) {
+                    tempo *= min(afterMs / fitMs, MAX_FIT_SPEEDUP)
+                }
+                tempo = tempo.coerceIn(0.7, 2.0)
+
+                // pitch ratio r is applied by resampling (which also changes the length
+                // by 1/r), so the stretch step has to make up for it.
+                val stretch = (tempo / ratio).coerceIn(0.5, 2.5)
+                if (abs(stretch - 1.0) > 0.02) x = wsola(x, stretch, rate)
+
+                // Pitch: the character's base shift plus the moving "acting" line.
+                // The moving line is centred on zero, so the length stays about the same.
+                x = resampleMoving(x, rate, semis, mood, question)
+
+                if (x.size < rate / 20) return false
             }
-            tempo = tempo.coerceIn(0.7, 2.0)
-
-            // pitch ratio r is applied by resampling (which also changes the length
-            // by 1/r), so the stretch step has to make up for it.
-            val stretch = (tempo / ratio).coerceIn(0.5, 2.5)
-            if (abs(stretch - 1.0) > 0.02) x = wsola(x, stretch, rate)
-
-            // Pitch: the character's base shift plus the moving "acting" line.
-            // The moving line is centred on zero, so the length stays about the same.
-            x = resampleMoving(x, rate, semis, mood, question)
-
-            if (x.size < rate / 20) return false
 
             // The voice of the feeling.
             if (mood.whisper) {
