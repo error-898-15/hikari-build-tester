@@ -109,7 +109,8 @@ class DubEngine(
     val active: Boolean get() = loop?.isActive == true
 
     /** A short note about why the neural voice last stopped (null = no problem). */
-    fun neuralReport(): String? = neural.report()
+    fun neuralReport(): String? =
+        neural.report() ?: SherpaModels.lastError?.let { "Voice download: $it" }
     var activeLang: String = ""
         private set
 
