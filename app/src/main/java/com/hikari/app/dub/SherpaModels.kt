@@ -721,7 +721,7 @@ object SherpaModels {
     // ───────────────────────── download / unpack ─────────────────────────
 
     /** One client for every voice download: the app's own DNS (with the DNS-over-HTTPS fallback). */
-    private val net: OkHttpClient by lazy {
+    private val voiceNet: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .followRedirects(true)
             .followSslRedirects(true)
@@ -801,7 +801,7 @@ object SherpaModels {
             .header("Accept-Encoding", "identity")
             .apply { if (have > 0) header("Range", "bytes=$have-") }
             .build()
-        return net.newCall(req).execute().use { resp ->
+        return voiceNet.newCall(req).execute().use { resp ->
             val code = resp.code
             if (code == 416) {
                 // "Range not satisfiable": the saved file is already whole (or damaged).
