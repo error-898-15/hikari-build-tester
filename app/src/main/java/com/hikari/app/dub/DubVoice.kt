@@ -6,7 +6,8 @@ import java.io.File
  * Something that can turn a sentence into an audio file.
  *
  * Three implementations ship:
- *  - [SherpaTtsVoice]  — offline neural voices (Piper, Hindi), several actors.
+ *  - [SherpaTtsVoice]  — offline neural voices: Piper men + CLONED women (Pocket TTS) for
+ *                        Hindi, Kokoro for English; several actors.
  *  - [GoogleTtsVoice]  — Google Translate's speaker button, online.
  *  - [LocalTtsVoice]   — the phone's own offline text-to-speech engine.
  */
@@ -32,6 +33,15 @@ interface DubVoice {
      * returns a much smaller pitch / speed change than the base voice needs.
      */
     fun fxFor(profile: VoiceProfile): VoiceProfile = profile
+
+    /**
+     * True when the clip this voice makes for [profile] must reach the listener with its
+     * own timbre untouched: no pitch change, no speed change, no "acting" effects (a
+     * cloned voice has to keep sounding like the recording it was cloned from). The audio
+     * editor then only trims, evens out the loudness and, when a line is too long for its
+     * slot, speeds it up without moving the pitch.
+     */
+    fun keepsOwnVoice(profile: VoiceProfile): Boolean = false
 
     fun release() {}
 }
