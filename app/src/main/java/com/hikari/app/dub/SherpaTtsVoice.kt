@@ -149,7 +149,9 @@ class SherpaTtsVoice(context: Context) : DubVoice {
             service = null
             connected = CompletableDeferred()
             crashes++
-            if (crashes >= 2) broken = true
+            // one crash must not end the dub for the rest of the video: only a voice that keeps
+            // dying (3 times without a single good line in between) is switched off
+            if (crashes >= 3) broken = true
             val step = lastStep()
             val tried = variant
             // Android writes the reason a moment after the process ends.
@@ -316,6 +318,7 @@ class SherpaTtsVoice(context: Context) : DubVoice {
                     null
                 }
                 out.exists() && out.length() > 0 -> {
+                    crashes = 0           // the helper works again: start counting from zero
                     if (!isLoaded) {
                         isLoaded = true
                         // It works: remember the way that worked, forget old problems.
