@@ -241,7 +241,7 @@ object DubDialog {
 
 /**
  * First use of the neural voice: downloads what is missing once (Hindi: the two men and the
- * cloning model for the two cloned women, about 300 MB; English: two voices, about 130 MB,
+ * cloning model for the cloned women, about 360 MB; English: two voices, about 130 MB,
  * from GitHub / Hugging Face) and shows the progress. [onDone] gets true when the dub can
  * start (everything is ready, or at least the part that matters is: see below).
  */
@@ -258,7 +258,7 @@ internal object NeuralDownload {
             textSize = 13f
             text = when {
                 english -> I18n.t("Downloading the English voices once (2 voices, about 130 MB). Keep this screen open and stay on Wi-Fi.")
-                hindi -> I18n.t("Downloading the Hindi voices once (2 men + the cloning model for the 2 cloned women, about 300 MB). Keep this screen open and stay on Wi-Fi.")
+                hindi -> I18n.t("Downloading the Hindi voices once (2 men + Priyamvada + the cloning model for the 2 cloned women, about 360 MB). Keep this screen open and stay on Wi-Fi.")
                 else -> I18n.t("Downloading the cloning model once (about 170 MB). Keep this screen open and stay on Wi-Fi.")
             }
         }
