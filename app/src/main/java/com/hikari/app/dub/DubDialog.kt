@@ -34,6 +34,9 @@ object DubPrefs {
     /** Own voice for every character + edited audio (on by default). */
     fun smart(c: Context): Boolean = p(c).getBoolean("smart", true)
     fun saveSmart(c: Context, v: Boolean) { p(c).edit().putBoolean("smart", v).apply() }
+    /** Listen to the ORIGINAL voices first, to tell men from women and to find the characters (on by default). */
+    fun scan(c: Context): Boolean = p(c).getBoolean("scan", true)
+    fun saveScan(c: Context, v: Boolean) { p(c).edit().putBoolean("scan", v).apply() }
     fun save(c: Context, lang: String, mode: VoiceMode, duck: Float) {
         p(c).edit().putString("lang", lang).putString("mode", mode.name).putFloat("duck2", duck).apply()
     }
@@ -70,6 +73,7 @@ object DubDialog {
         onUpload: () -> Unit,
         onStop: () -> Unit,
         onStart: (lang: String, mode: VoiceMode, duck: Float, multi: Boolean) -> Unit,
+        onGenerate: (() -> Unit)? = null,
     ) {
         val d = activity.resources.displayMetrics.density
         fun pad(v: Int) = (v * d).toInt()
@@ -110,6 +114,13 @@ object DubDialog {
                     root.addView(note(I18n.t("This subtitle is inside the video, so each line is read when it appears on screen.")))
                 }
             }
+        }
+
+        // No usable subtitle: the voice of the video can write one.
+        if (!canStart && onGenerate != null) {
+            root.addView(
+                note(I18n.t("No subtitle for this video? Tap \"Make subtitle from voice\": the app listens to the sound of the video and writes the subtitle, then you can dub it."))
+            )
         }
 
         // Which characters the subtitle names (only when its text is available).
@@ -176,6 +187,14 @@ object DubDialog {
         }
         root.addView(smartBox)
 
+        // 6) listen to the original voices (man / woman and who is who)
+        val scanBox = CheckBox(activity).apply {
+            text = I18n.t("Listen to the original voices first (tells men from women; takes about 2 minutes, downloads a ~40 MB model once)")
+            isChecked = DubPrefs.scan(activity)
+            setPadding(0, pad(8), 0, 0)
+        }
+        root.addView(scanBox)
+
         val builder = AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle(I18n.t("Dub audio"))
             .setView(root)
@@ -192,6 +211,7 @@ object DubDialog {
                 val multi = smartBox.isChecked
                 DubPrefs.save(activity, lang, mode, duck)
                 DubPrefs.saveSmart(activity, multi)
+                DubPrefs.saveScan(activity, scanBox.isChecked)
                 when {
                     mode != VoiceMode.NEURAL -> onStart(lang, mode, duck, multi)
                     !SherpaModels.supportsNeural(lang) -> {
@@ -209,6 +229,8 @@ object DubDialog {
                     }
                 }
             }
+        } else if (onGenerate != null) {
+            builder.setPositiveButton(I18n.t("Make subtitle from voice")) { _, _ -> onGenerate.invoke() }
         }
         builder.show()
     }
