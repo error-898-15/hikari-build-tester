@@ -91,7 +91,10 @@ jobs:
       - name: Fetch sherpa-onnx (offline neural voices)
         run: |
           set -e
-          VER=1.12.13
+          # 1.13.8 (was 1.12.13): the cloned Hindi voices run on sherpa-onnx's Pocket TTS
+          # engine, which only exists from 1.12.24 on (1.13.8 is the version the Pocket TTS
+          # multilingual voice pack was tested with). The Kokoro / Piper voices run on it too.
+          VER=1.13.8
           WORK=/tmp/sherpa
           rm -rf "$WORK" && mkdir -p "$WORK" && cd "$WORK"
           curl -fsSL --retry 5 --retry-delay 10 -o android.tar.bz2 \
@@ -109,44 +112,15 @@ jobs:
           if [ -z "$TTS_KT" ]; then echo "::error::sherpa-onnx Tts.kt not found"; exit 1; fi
           mkdir -p app/src/main/java/com/k2fsa/sherpa/onnx
           cp "$TTS_KT" app/src/main/java/com/k2fsa/sherpa/onnx/Tts.kt
-          # The voice scan (who speaks each line, man or woman) uses the speaker
-          # fingerprint classes of the same sherpa-onnx release. They are reached
-          # by reflection, so if they cannot be found this is only a warning: the
-          # build still works and the scan falls back to pitch alone.
-          for PAT in "class SpeakerEmbeddingExtractor" "class OnlineStream"; do
-            F=$(grep -rlE "^(open |data )?${PAT}[ (<{]" "$WORK/src" --include=*.kt 2>/dev/null | grep "kotlin-api" | head -n1 || true)
-            if [ -n "$F" ]; then
-              cp "$F" "app/src/main/java/com/k2fsa/sherpa/onnx/$(basename "$F")"
-              echo "sherpa-onnx speaker file copied: $(basename "$F")"
-            else
-              echo "::warning::sherpa-onnx source for '${PAT}' not found - the voice scan will use pitch only"
-            fi
-          done
-          # Speaker.kt of this sherpa-onnx release uses SpeakerEmbeddingExtractorConfig
-          # but does not define it. Add it if no file defines it (needed to compile).
-          if [ -f app/src/main/java/com/k2fsa/sherpa/onnx/Speaker.kt ] && ! grep -rq "class SpeakerEmbeddingExtractorConfig" app/src/main/java/com/k2fsa/sherpa/onnx/; then
-            printf '\ndata class SpeakerEmbeddingExtractorConfig(\n    var model: String = "",\n    var numThreads: Int = 1,\n    var debug: Boolean = false,\n    var provider: String = "cpu",\n)\n' >> app/src/main/java/com/k2fsa/sherpa/onnx/Speaker.kt
-          fi
-          # Writing a subtitle from the voice of a video (Whisper speech-to-text +
-          # Silero voice detection) needs the OfflineRecognizer / Vad classes of the
-          # same release. The files of the Kotlin API use each other, so the rest of
-          # the folder is copied (only files that are not there yet), and their names
-          # are remembered in /tmp/sherpa-extra.txt. The app reaches these classes by
-          # reflection, so if they ever fail to compile the build step below removes
-          # exactly these files and builds again: the feature switches itself off and
-          # the build never fails because of it.
-          KAPI=$(dirname "$TTS_KT")
-          : > /tmp/sherpa-extra.txt
-          for F in "$KAPI"/*.kt; do
-            B=$(basename "$F")
-            if [ ! -f "app/src/main/java/com/k2fsa/sherpa/onnx/$B" ]; then
-              cp "$F" "app/src/main/java/com/k2fsa/sherpa/onnx/$B"
-              echo "$B" >> /tmp/sherpa-extra.txt
-            fi
-          done
-          for NEED in OfflineRecognizer.kt OfflineStream.kt Vad.kt; do
-            if [ ! -f "app/src/main/java/com/k2fsa/sherpa/onnx/$NEED" ]; then
-              echo "::warning::sherpa-onnx $NEED not found - subtitle from voice will not work"
+          # The dub code calls these names. If a sherpa-onnx version ever drops one, say so
+          # here, in one clear line, instead of as a pile of Kotlin errors further down.
+          for sym in OfflineTtsPocketModelConfig GenerationConfig generateWithConfig \
+                     referenceAudio referenceSampleRate numSteps lmFlow lmMain textConditioner \
+                     vocabJson tokenScoresJson OfflineTtsKokoroModelConfig OfflineTtsVitsModelConfig \
+                     "var pocket"; do
+            if ! grep -q "$sym" app/src/main/java/com/k2fsa/sherpa/onnx/Tts.kt; then
+              echo "::error::sherpa-onnx v${VER} Tts.kt has no '$sym' - the cloned voices need a version that has it (1.12.24 or newer)."
+              exit 1
             fi
           done
           if ! grep -q "commons-compress" app/build.gradle.kts; then
@@ -233,14 +207,6 @@ jobs:
             if [ $code -eq 124 ] || grep -qE "429|Too Many Requests|Connection reset|Read timed out|SocketTimeout|connect timed out|Could not resolve|Unable to load Maven meta-data" gradle-build.log; then
               echo "==== Attempt $attempt hit a rate-limit or network stall (exit $code); retrying in 45s ===="
               sleep 45
-            elif [ -s /tmp/sherpa-extra.txt ]; then
-              echo "==== Attempt $attempt failed (exit $code) with the extra sherpa-onnx files; first errors: ===="
-              grep -E "^e: " gradle-build.log | head -n 40 || true
-              echo "==== Removing the extra sherpa-onnx files (subtitle from voice is switched off) and building again ===="
-              while read -r EXTRA; do
-                rm -f "app/src/main/java/com/k2fsa/sherpa/onnx/$EXTRA"
-              done < /tmp/sherpa-extra.txt
-              : > /tmp/sherpa-extra.txt
             else
               echo "==== Attempt $attempt failed with a non-network error; stopping ===="
               break
