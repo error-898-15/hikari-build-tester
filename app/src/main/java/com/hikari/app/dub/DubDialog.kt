@@ -5,6 +5,7 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.DialogInterface
 import android.view.View
 import android.view.WindowManager
 import android.widget.AdapterView
@@ -328,7 +329,7 @@ internal object NeuralDownload {
                 else b.setPositiveButton(I18n.t("Close")) { _, _ -> onDone(false) }
                 val box2 = b.create()
                 box2.show()
-                box2.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+                box2.getButton(DialogInterface.BUTTON_NEUTRAL)?.setOnClickListener {
                     runCatching {
                         val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         cm.setPrimaryClip(ClipData.newPlainText("voice download", text))
