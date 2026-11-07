@@ -6,7 +6,8 @@
 #  Run it by hand, once:  Actions tab -> "Build clone model" -> Run workflow.
 #  It takes about 15-30 minutes. It:
 #    1. downloads the open model Thanushttk/pocket-tts-multilingual (CC-BY-4.0),
-#    2. converts it to the 7 files sherpa-onnx needs,
+#    2. converts it to the 7 files sherpa-onnx needs (exporter: lomotron/pocket-tts-onnx-export;
+#       if it fails the real error is shown in the red "Annotations" box on top of the run page),
 #    3. LISTENS to it with the real sherpa-onnx engine (a Hindi line must be spoken,
 #       not silent, not 40 seconds of noise) - if that fails NOTHING is published,
 #    4. uploads the 7 files to the pre-release "clone-model" of this repository.
@@ -35,14 +36,18 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install tools
         run: |
           set -e
           python -m pip install --upgrade pip
-          pip install numpy scipy onnx onnxruntime sentencepiece safetensors huggingface_hub pyyaml soundfile
+          # torch 2.9.1 (CPU) is the version the exporter is known to work with
+          pip install "torch==2.9.1" --index-url https://download.pytorch.org/whl/cpu || pip install "torch==2.9.1"
+          pip install numpy scipy onnx onnxruntime onnxscript beartype einops pydantic typer requests \
+            typing_extensions sentencepiece safetensors huggingface_hub pyyaml soundfile
           pip install "sherpa-onnx==1.13.8" || pip install sherpa-onnx
+          python -c "import torch, onnx, onnxruntime; print('torch', torch.__version__, 'onnx', onnx.__version__, 'ort', onnxruntime.__version__)"
           python -c "import sherpa_onnx; print('sherpa_onnx', getattr(sherpa_onnx, '__version__', '?'))"
 
       - name: Download the open model (Thanushttk/pocket-tts-multilingual)
@@ -73,32 +78,15 @@ jobs:
 
       - name: Convert to the sherpa-onnx files
         run: |
-          set +e
-          OK=0
-          for SPEC in \
-            "https://github.com/csukuangfj/pocket-tts-onnx-export.git f075c00bf4bbfbb081a11fd99abbf39df3849e0c" \
-            "https://github.com/lomotron/pocket-tts-onnx-export.git main" \
-            "https://github.com/KevinAHM/pocket-tts-onnx-export.git main"; do
-            set -- $SPEC
-            URL=$1; REF=$2
-            echo "=================== exporter: $URL @ $REF ==================="
-            rm -rf /tmp/exporter /tmp/out
-            git clone "$URL" /tmp/exporter || continue
-            (cd /tmp/exporter && git checkout "$REF") || continue
-            if [ -f /tmp/exporter/requirements.txt ]; then
-              pip install -r /tmp/exporter/requirements.txt || echo "::warning::requirements.txt of $URL did not fully install"
-            else
-              pip install torch --index-url https://download.pytorch.org/whl/cpu
-            fi
-            python scripts/clone_model/convert.py export --exporter /tmp/exporter --src /tmp/thanush || continue
-            python scripts/clone_model/convert.py collect --exporter /tmp/exporter --src /tmp/thanush --sherpa /tmp/sherpa-src --out /tmp/out || continue
-            OK=1
-            break
-          done
-          if [ "$OK" != "1" ]; then
-            echo "::error::Could not convert the model with any exporter. Open the log above, copy the last error and send it back."
-            exit 1
-          fi
+          python scripts/clone_model/convert.py all --src /tmp/thanush --sherpa /tmp/sherpa-src --out /tmp/out
+
+      - name: Upload the conversion logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clone-model-logs
+          path: /tmp/clone-model-logs
+          if-no-files-found: ignore
 
       - name: Self test - listen to the model with sherpa-onnx
         run: |
