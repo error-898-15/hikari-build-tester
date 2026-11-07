@@ -1,3 +1,14 @@
+
+0.12.27 (continuous build only)
+Voice files are fetched with the app's own network client (the same DNS and DNS-over-HTTPS fallback as the rest of the app), ask for the plain file (no gzip, which broke resumed downloads), and try again up to 4 times, continuing from what is already saved, when the connection drops.
+Dub audio: voice download fixes
+The cloning model download checks that every file is really the model (a web page or a cut file is thrown away instead of being kept) and tries each address in CLONE_BASES, including a public Hugging Face mirror as the last one.
+When a voice cannot be downloaded the REAL reason is shown in a box (which host, which file, what error) with Copy / Try again / Dub with the ready voices, instead of a toast that cut the message off.
+The English voices bar (Kokoro) no longer restarts at 0% when it goes from downloading to unpacking.
+The last voice download error is also kept for the Dub audio panel ("Last neural voice problem: Voice download: ..."), so it can be read there even after the box is closed.
+
+
+
 ## 0.12.27 (continuous build only)
 
 ### Dub audio: cloned Hindi voices
