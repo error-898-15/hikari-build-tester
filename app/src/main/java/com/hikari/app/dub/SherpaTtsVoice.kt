@@ -33,7 +33,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * the audio file. If the helper dies twice, the neural voice switches itself
  * off for this dub.
  *
- * Actors, Hindi: two real Piper men (Rohan, Pratham) and two CLONED women
+ * Actors, Hindi: two real Piper men (Rohan, Pratham), one real Piper woman (Priyamvada,
+ * fast; she is the main woman's voice) and two CLONED women
  * (Myira, Kyra). The cloned women are made by the Pocket TTS model from the
  * recordings in assets/dub/voices/, and they are never bent afterwards: no pitch
  * change, no speed change, no acting effects ([keepsOwnVoice]), so they keep
@@ -81,8 +82,18 @@ class SherpaTtsVoice(context: Context) : DubVoice {
 
     /** Which way of starting the voice is tried now (see [NeuralTtsService]). */
     private var variant: Int
-        get() = prefs.getInt("variant", 0).coerceIn(0, 2)
-        set(v) { prefs.edit().putInt("variant", v).apply() }
+        get() {
+            val v = prefs.getInt("variant", 0).coerceIn(0, 2)
+            // A "safer" way (fewer voices in memory) makes the dub MUCH slower, because the
+            // voices are then loaded again and again. It must not stay for ever after one
+            // crash: after a while the normal way is tried again.
+            if (v != 0 && System.currentTimeMillis() - prefs.getLong("variant_at", 0L) > VARIANT_RETRY_MS) {
+                prefs.edit().putInt("variant", 0).remove("good_variant").apply()
+                return 0
+            }
+            return v
+        }
+        set(v) { prefs.edit().putInt("variant", v).putLong("variant_at", System.currentTimeMillis()).apply() }
 
     /** A short note about the last problem, or null when there was none. */
     fun report(): String? = prefs.getString("report", null)
@@ -120,6 +131,8 @@ class SherpaTtsVoice(context: Context) : DubVoice {
     // ───────────────────────── helper process link ─────────────────────────
 
     private val pending = ConcurrentHashMap<Int, CompletableDeferred<String>>()
+    /** How long the helper needed to make each answered line (ms), by request id. */
+    private val tookById = ConcurrentHashMap<Int, Long>()
     private val nextId = AtomicInteger(1)
 
     @Volatile private var service: Messenger? = null
@@ -132,7 +145,12 @@ class SherpaTtsVoice(context: Context) : DubVoice {
                 val d = msg.data
                 val ok = d.getBoolean(NeuralIpc.K_OK)
                 val text = if (ok) "" else (d.getString(NeuralIpc.K_ERR) ?: "failed").ifEmpty { "failed" }
-                pending.remove(d.getInt(NeuralIpc.K_ID))?.complete(text)
+                val rid = d.getInt(NeuralIpc.K_ID)
+                val waiter = pending.remove(rid)
+                if (waiter != null) {
+                    tookById[rid] = d.getLong(NeuralIpc.K_MS)
+                    waiter.complete(text)
+                }
             }
             true
         }
@@ -218,6 +236,49 @@ class SherpaTtsVoice(context: Context) : DubVoice {
         // a new dub gets a fresh chance
         crashes = 0
         broken = false
+        cloneOff = false
+        synchronized(cloneTimes) { cloneTimes.clear() }
+        notice = null
+    }
+
+    // ───────────────────────── cloned voice speed guard ─────────────────────────
+
+    /** True when the cloned women are too slow on this phone: women then use a Piper voice. */
+    @Volatile private var cloneOff = false
+    private val cloneTimes = java.util.ArrayDeque<Long>()
+    @Volatile private var notice: String? = null
+
+    /** A one-time message for the person (read once by the dub engine), or null. */
+    fun takeNotice(): String? {
+        val n = notice
+        notice = null
+        return n
+    }
+
+    /**
+     * The cloning model is much slower than the Piper voices. If, on this phone, it cannot make
+     * lines faster than the video plays, the dub would fall behind and lines would be skipped.
+     * So when the last few cloned lines were all slow, the cloned women are put aside for this
+     * dub and the women's lines are spoken by the (fast) Piper woman Priyamvada instead.
+     * Every line is dubbed, only the women's voice is different.
+     */
+    private fun noteCloneSpeed(ms: Long) {
+        if (ms <= 0L || cloneOff) return
+        var slow = false
+        var avg = 0L
+        synchronized(cloneTimes) {
+            cloneTimes.addLast(ms)
+            while (cloneTimes.size > CLONE_WINDOW) cloneTimes.removeFirst()
+            avg = cloneTimes.average().toLong()
+            if (cloneTimes.size >= CLONE_WINDOW && avg > CLONE_SLOW_MS) slow = true
+        }
+        if (!slow) return
+        cloneOff = true
+        // characters that had a cloned voice pick again; the others keep their actor
+        synchronized(assigned) { assigned.values.removeAll { it.voice.clone } }
+        notice = "Dub: the cloned voices are too slow on this phone, so the women's lines use the fast " +
+            "voice now. Every line is still dubbed."
+        Logs.log("Dub", "Cloned voice too slow ($avg ms per line): switched off for this dub")
     }
 
     // ───────────────────────── DubVoice ─────────────────────────
@@ -306,6 +367,7 @@ class SherpaTtsVoice(context: Context) : DubVoice {
             // The first line of each voice also has to load it, so allow a while.
             val res = withTimeoutOrNull(90_000L) { answer.await() }
             pending.remove(id)
+            val tookMs = tookById.remove(id) ?: 0L
             when {
                 res == null -> {
                     lastError = "the voice took too long"
@@ -319,6 +381,7 @@ class SherpaTtsVoice(context: Context) : DubVoice {
                 }
                 out.exists() && out.length() > 0 -> {
                     crashes = 0           // the helper works again: start counting from zero
+                    if (cloned) noteCloneSpeed(tookMs)
                     if (!isLoaded) {
                         isLoaded = true
                         // It works: remember the way that worked, forget old problems.
@@ -345,7 +408,9 @@ class SherpaTtsVoice(context: Context) : DubVoice {
     /** Picks the actor for a character (same character = same actor all video). */
     private fun actorFor(p: VoiceProfile): Actor = synchronized(assigned) {
         assigned.getOrPut(voiceLang + "|" + p.name + "|" + p.key) {
-            val ready = SherpaModels.readyVoicesFor(app, voiceLang)
+            val all = SherpaModels.readyVoicesFor(app, voiceLang)
+            // clones put aside because they are too slow (unless nothing else is installed)
+            val ready = if (cloneOff) all.filter { !it.clone }.ifEmpty { all } else all
             when {
                 ready.isEmpty() -> error("no voice installed")
                 p.name == "Narrator" -> pick(true, 0, ready)       // main / unnamed voice
@@ -404,6 +469,13 @@ class SherpaTtsVoice(context: Context) : DubVoice {
          * sherpa-onnx examples use: fast and clean. More steps = slower, a little smoother.
          */
         private const val CLONE_STEPS = 2
+
+        /** The cloned women are put aside when the last [CLONE_WINDOW] lines took longer than this on average (ms). */
+        private const val CLONE_SLOW_MS = 6_000L
+        private const val CLONE_WINDOW = 5
+
+        /** A "safer" (slower) way of starting the voice is tried again after this long. */
+        private const val VARIANT_RETRY_MS = 30L * 60_000L
 
         /** (pitch in semitones, speed) for the 1st, 2nd, 3rd ... character on one speaker. */
         private val FEMALE_LOOK = listOf(0f to 1.00f, 2.0f to 1.06f, -1.5f to 0.95f, 3.5f to 1.10f)
