@@ -64,6 +64,10 @@ class DubEngine(
     private val setOriginalVolume: (Float) -> Unit,
     /** Short messages for the user (shown as a toast by the caller). */
     private val onStatus: (String) -> Unit,
+    /** Pauses the video while the next dub line is still being made (optional). */
+    private val holdVideo: () -> Unit = {},
+    /** Lets the video go on again after [holdVideo] (optional). */
+    private val releaseVideo: () -> Unit = {},
 ) {
     private val google = GoogleTtsVoice(context)
     private val local = LocalTtsVoice(context)
@@ -126,6 +130,19 @@ class DubEngine(
     private var neuralLoadingShown = false
     private var neuralProblemShown = false
 
+    // The video waits (like buffering) when the voice has not finished the line that is about
+    // to start, so no line is skipped because the voice is slower than the video.
+    // Main thread only.
+    private var holdEnabled = false
+    private var heldByDub = false
+    private var holdIdx = -1
+    private var holdSince = 0L
+    private var holdNoticeShown = false
+    private var holdTimeouts = 0
+    private val holdGaveUp = HashSet<Int>()
+    /** Seconds to wait before a failed line is tried again. */
+    private var retryAfterMs = RETRY_AFTER_MS
+
     /** One caption waiting to be voiced (live mode). */
     private class LiveLine(val cue: DubCue, val windowMs: Long, val at: Long)
 
@@ -166,6 +183,13 @@ class DubEngine(
         val neuralLikely = (mode == VoiceMode.NEURAL || mode == VoiceMode.AUTO) &&
             SherpaModels.isInstalledFor(context, lang)
         lookaheadMs = if (neuralLikely) NEURAL_LOOKAHEAD_MS else LOOKAHEAD_MS
+        holdEnabled = neuralLikely && !live
+        heldByDub = false
+        holdIdx = -1
+        holdTimeouts = 0
+        holdNoticeShown = false
+        holdGaveUp.clear()
+        retryAfterMs = if (neuralLikely) NEURAL_RETRY_AFTER_MS else RETRY_AFTER_MS
         if (translations.size > 4000) translations.clear()
         attempts.clear()
         empty.clear()
@@ -209,6 +233,8 @@ class DubEngine(
     }
 
     fun stop() {
+        releaseHold()
+        holdEnabled = false
         loop?.cancel()
         loop = null
         liveWatch?.cancel(); liveWatch = null
@@ -228,6 +254,7 @@ class DubEngine(
 
     /** Stops the engine AND frees the text-to-speech engine. */
     fun release() {
+        heldByDub = false          // the player is going away: do not start it again
         stop()
         local.release()
         neural.release()
@@ -317,6 +344,7 @@ class DubEngine(
                 else if (isPlaying() && !mp.isPlaying && clipStarted) mp.start()
             }
         }
+        if (holdEnabled) manageHold(pos)
         if (!isPlaying()) return
 
         // Take the original dialogue out (or, for mono sound, lower it).
@@ -325,8 +353,11 @@ class DubEngine(
         val idx = cueIndexAt(pos)
         if (idx < 0 || idx == spokenIdx) return
         val cue = cues[idx]
-        if (pos >= cue.endMs - 300L) return          // too late to start this one
+        if (pos >= cue.endMs) return                 // too late to start this one
         val file = ready[idx] ?: return              // not voiced yet; try again next tick
+        if (clip != null && clipStarted && pos - cue.startMs < MAX_WAIT_FOR_PREVIOUS_MS) {
+            return                                   // the line before is still speaking: do not cut it off
+        }
         if (!file.exists()) {                        // the cache folder was cleaned: make it again
             ready.remove(idx)
             return
@@ -335,6 +366,85 @@ class DubEngine(
         val nextStart = cues.getOrNull(idx + 1)?.startMs ?: Long.MAX_VALUE
         val windowMs = (minOf(nextStart, cue.endMs + 700L) - pos).coerceAtLeast(600L)
         playClip(file, windowMs)
+    }
+
+    /**
+     * Pauses the video (like buffering) while the line that is about to start is still being
+     * made, and lets it go on the moment that line is ready. Without this a voice that is slower
+     * than the video loses every line it was not ready for.
+     */
+    private fun manageHold(pos: Long) {
+        val now = SystemClock.elapsedRealtime()
+        if (heldByDub) {
+            if (isPlaying()) {
+                // the person pressed play themselves: they win, for this line
+                if (holdIdx >= 0) holdGaveUp.add(holdIdx)
+                heldByDub = false
+                holdIdx = -1
+                return
+            }
+            val need = holdTarget(pos)
+            if (need < 0) {
+                holdTimeouts = 0
+                releaseHold()
+                return
+            }
+            if (need != holdIdx) {                   // a seek moved us to another line
+                holdIdx = need
+                holdSince = now
+                return
+            }
+            val limit = if (ready.isEmpty()) HOLD_FIRST_MS else HOLD_LINE_MS
+            if (now - holdSince > limit) {
+                holdGaveUp.add(holdIdx)
+                holdTimeouts++
+                releaseHold()
+                if (holdTimeouts >= 2) {
+                    holdEnabled = false
+                    onStatus(
+                        "Dub: the voice is too slow on this phone, so the video will not wait for it any more. " +
+                            "Some lines can be missed."
+                    )
+                }
+            }
+            return
+        }
+        if (!isPlaying()) return
+        val need = holdTarget(pos)
+        if (need < 0) return
+        heldByDub = true
+        holdIdx = need
+        holdSince = now
+        holdVideo()
+        prefetch()                                   // start the work on this line right now
+        if (!holdNoticeShown) {
+            holdNoticeShown = true
+            onStatus("Dub: the video waits a moment while the voice line is made, so no line is skipped.")
+        }
+    }
+
+    /** First line from now until just ahead that must be voiced and is not ready yet, or -1. */
+    private fun holdTarget(pos: Long): Int {
+        val last = cueIndexAt(pos + HOLD_LEAD_MS)
+        if (last < 0) return -1
+        var j = cueIndexAt(pos).coerceAtLeast(0)
+        while (j <= last && j < cues.size) {
+            val unresolved = j != spokenIdx &&
+                !ready.containsKey(j) &&
+                !empty.contains(j) &&
+                (attempts[j] ?: 0) < MAX_ATTEMPTS &&
+                !holdGaveUp.contains(j)
+            if (unresolved && cues[j].endMs - 300L > pos) return j
+            j++
+        }
+        return -1
+    }
+
+    private fun releaseHold() {
+        if (!heldByDub) return
+        heldByDub = false
+        holdIdx = -1
+        releaseVideo()
     }
 
     /** Index of the last cue that starts at or before [pos], or -1. */
@@ -491,7 +601,7 @@ class DubEngine(
                         val n = (attempts[idx] ?: 0) + 1
                         attempts[idx] = n
                         // Retry later (a rate-limit is temporary), but not for ever.
-                        if (n < MAX_ATTEMPTS) scope.launch { delay(RETRY_AFTER_MS); failed.remove(idx) }
+                        if (n < MAX_ATTEMPTS) scope.launch { delay(retryAfterMs); failed.remove(idx) }
                         noticeFailureOnce()
                     }
                     // else: dropped because its time passed. Not an error.
@@ -510,7 +620,7 @@ class DubEngine(
     }
 
     private suspend fun prepare(idx: Int): File? =
-        prepareCue(cues[idx], fitWindowMs(idx)) { wanted(idx) }
+        prepareCue(cues[idx], fitWindowMs(idx), attempts[idx] ?: 0) { wanted(idx) }
 
     /** Answer of [prepareCue] for a line that has nothing to say. */
     private val NOTHING_TO_SAY = File("nothing-to-say")
@@ -519,14 +629,24 @@ class DubEngine(
      * Translates and voices one line. Returns the audio file, [NOTHING_TO_SAY],
      * or null when it failed OR when [stillWanted] turned false (its time passed).
      */
-    private suspend fun prepareCue(cue: DubCue, fitMs: Long, stillWanted: () -> Boolean): File? {
+    private suspend fun prepareCue(
+        cue: DubCue,
+        fitMs: Long,
+        attempt: Int = 0,
+        stillWanted: () -> Boolean,
+    ): File? {
         val tKey = lang + "|" + cue.text
         var translated = translations[tKey]
         if (translated == null) {
             val t = translateGate.withPermit { Translator.translateTo(cue.text, lang) }
             // A failed translation comes back unchanged. Reading English with a
             // Hindi voice only makes noise, so count it as a failure and retry.
-            if (looksUntranslated(cue.text, t)) return null
+            if (looksUntranslated(cue.text, t)) {
+                // A name or a short cry ("Mayu.", "Hey!") often comes back unchanged. After one
+                // retry it is spoken as it is, instead of the line being lost.
+                val words = cue.text.trim().split(' ').count { it.isNotBlank() }
+                if (attempt < 1 || words > 3) return null
+            }
             translated = t.ifBlank { cue.text }
             translations[tKey] = translated
         }
@@ -645,9 +765,18 @@ class DubEngine(
         private const val NEURAL_LOOKAHEAD_MS = 20L * 60_000L
         /** Lines being made at the same moment (keeps the work in playback order). */
         private const val MAX_QUEUED = 8
-        private const val MAX_ATTEMPTS = 3
+        private const val MAX_ATTEMPTS = 6
         private const val LIVE_STALE_MS = 15_000L
         private const val RETRY_AFTER_MS = 15_000L
+        /** The neural voice runs on the phone: a failed line is tried again quickly. */
+        private const val NEURAL_RETRY_AFTER_MS = 2_500L
+        /** The video waits at most this long for one line (the first one also loads the voice). */
+        private const val HOLD_LINE_MS = 15_000L
+        private const val HOLD_FIRST_MS = 75_000L
+        /** The video waits when a line that starts within this time is not ready. */
+        private const val HOLD_LEAD_MS = 400L
+        /** A new line waits at most this long for the one that is still speaking (instead of cutting it). */
+        private const val MAX_WAIT_FOR_PREVIOUS_MS = 3_000L
         private const val MAX_SPEED = 1.6f
         /** The audio stage runs this far ahead of what is heard: cut the dialogue that much earlier. */
         private const val CUT_LEAD_MS = 500L
