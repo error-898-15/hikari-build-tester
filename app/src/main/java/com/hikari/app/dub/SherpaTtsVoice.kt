@@ -33,12 +33,15 @@ import java.util.concurrent.atomic.AtomicInteger
  * the audio file. If the helper dies twice, the neural voice switches itself
  * off for this dub.
  *
- * Actors: three real Hindi speakers (Priyamvada = woman, Rohan and Pratham =
- * men) for Hindi, and two English Kokoro speakers (Heart = woman, Michael =
- * man) for English. A character keeps the same actor for the whole video. Characters that
- * have to share a speaker get a different speaking speed (done inside the
- * voice, so it stays clean) and a different pitch ([fxFor], applied by the
- * audio editor), so two characters never sound the same.
+ * Actors, Hindi: two real Piper men (Rohan, Pratham) and two CLONED women
+ * (Myira, Kyra). The cloned women are made by the Pocket TTS model from the
+ * recordings in assets/dub/voices/, and they are never bent afterwards: no pitch
+ * change, no speed change, no acting effects ([keepsOwnVoice]), so they keep
+ * sounding exactly like their recordings. English: two Kokoro speakers
+ * (Heart = woman, Michael = man). A character keeps the same actor for the whole
+ * video. Piper / Kokoro characters that have to share a speaker get a different
+ * speaking speed (done inside the voice, so it stays clean) and a different
+ * pitch ([fxFor], applied by the audio editor), so two characters never sound the same.
  */
 class SherpaTtsVoice(context: Context) : DubVoice {
 
@@ -46,6 +49,11 @@ class SherpaTtsVoice(context: Context) : DubVoice {
 
     private val app: Context = context.applicationContext
     private val dir = File(app.cacheDir, "dub").apply { mkdirs() }
+
+    init {
+        // the old Piper woman is gone for good: free the space her files used
+        SherpaModels.cleanupRemoved(app)
+    }
 
     @Volatile private var broken = false
     @Volatile private var crashes = 0
@@ -224,6 +232,12 @@ class SherpaTtsVoice(context: Context) : DubVoice {
         return VoiceProfile(profile.gender, a.semitones, 1f, profile.name)
     }
 
+    /** A cloned actor that is not bent (no pitch / speed change) must keep its own timbre. */
+    override fun keepsOwnVoice(profile: VoiceProfile): Boolean {
+        val a = try { actorFor(profile) } catch (t: Throwable) { return false }
+        return a.voice.clone && a.semitones == 0f
+    }
+
     override suspend fun synthesize(text: String, lang: String, profile: VoiceProfile): File? =
         withContext(Dispatchers.IO) {
             voiceLang = lang
@@ -233,7 +247,17 @@ class SherpaTtsVoice(context: Context) : DubVoice {
                 lastError = "no neural voice is installed"
                 return@withContext null
             }
-            val out = File(dir, GoogleTtsVoice.key("p1", lang, actor.voice.id + "|" + actor.speed + "|" + text) + ".wav")
+            val cloned = actor.voice.clone
+            val say = if (cloned) cloneText(text) else text
+            if (say.isBlank()) return@withContext null
+            val out = File(
+                dir,
+                GoogleTtsVoice.key(
+                    if (cloned) "pk1" else "p1",
+                    lang,
+                    actor.voice.id + "|" + actor.speed + "|" + (if (cloned) CLONE_STEPS.toString() else "") + "|" + say,
+                ) + ".wav",
+            )
             if (out.exists() && out.length() > 0) return@withContext out
 
             if (!ensureConnected()) return@withContext null
@@ -244,7 +268,14 @@ class SherpaTtsVoice(context: Context) : DubVoice {
             pending[id] = answer
             val data = Bundle().apply {
                 putInt(NeuralIpc.K_ID, id)
-                if (actor.voice.kokoro) {
+                if (cloned) {
+                    // the voice is copied from the actor's recording by the cloning model
+                    putString(NeuralIpc.K_DIR, SherpaModels.cloneDir(app).path)
+                    putString(NeuralIpc.K_DATA, "")
+                    putString(NeuralIpc.K_KIND, "pocket")
+                    putString(NeuralIpc.K_REF, actor.voice.ref)
+                    putInt(NeuralIpc.K_STEPS, CLONE_STEPS)
+                } else if (actor.voice.kokoro) {
                     putString(NeuralIpc.K_DIR, SherpaModels.kokoroDir(app).path)
                     putString(NeuralIpc.K_DATA, SherpaModels.kokoroEspeakDir(app).path)
                     putString(NeuralIpc.K_KIND, "kokoro")
@@ -253,7 +284,7 @@ class SherpaTtsVoice(context: Context) : DubVoice {
                     putString(NeuralIpc.K_DATA, SherpaModels.espeakDir(app).path)
                     putString(NeuralIpc.K_KIND, "piper")
                 }
-                putString(NeuralIpc.K_TEXT, text)
+                putString(NeuralIpc.K_TEXT, say)
                 putInt(NeuralIpc.K_SID, actor.voice.sid)
                 putFloat(NeuralIpc.K_SPEED, actor.speed)
                 putString(NeuralIpc.K_OUT, out.path)
@@ -321,8 +352,9 @@ class SherpaTtsVoice(context: Context) : DubVoice {
                 p.gender == Gender.FEMALE -> pick(true, femaleCount++, ready)
                 p.gender == Gender.MALE -> pick(false, maleCount++, ready)
                 p.gender == Gender.CHILD -> {
+                    // a child is a higher, faster woman's voice (this one is bent on purpose)
                     val w = ready.firstOrNull { it.gender == Gender.FEMALE } ?: ready.first()
-                    Actor(w, 1.08f, 4.5f)
+                    Actor(w, if (w.clone) 1.0f else 1.08f, 4.5f)
                 }
                 else -> pick(true, 0, ready)
             }
@@ -333,17 +365,43 @@ class SherpaTtsVoice(context: Context) : DubVoice {
      * The k-th woman / man of the video. Real speakers are used first
      * (round robin); once they are all taken the next character shares a
      * speaker but speaks at a different speed and pitch.
+     *
+     * A CLONED voice is never bent: when two characters share one, they simply
+     * share it. Its whole point is to sound like its recording.
      */
     private fun pick(female: Boolean, k: Int, ready: List<PiperVoice>): Actor {
         val own = ready.filter { (it.gender == Gender.FEMALE) == female }
         val pool = if (own.isNotEmpty()) own else ready
+        val voice = pool[k % pool.size]
+        if (voice.clone && own.isNotEmpty()) return Actor(voice, 1.0f, 0f)
         val look = (if (female) FEMALE_LOOK else MALE_LOOK)[(k / pool.size) % FEMALE_LOOK.size]
         // no voice of that sex is installed: borrow the other one and move its pitch
         val borrow = if (own.isEmpty()) (if (female) 4.5f else -4.5f) else 0f
-        return Actor(pool[k % pool.size], look.second, look.first + borrow)
+        return Actor(voice, look.second, look.first + borrow)
+    }
+
+    /**
+     * Tidies a line for the cloning model: the Hindi full stop (danda) becomes a normal
+     * full stop and the line always ends like a sentence, which is how the model's
+     * training text ended.
+     */
+    private fun cloneText(t: String): String {
+        val s = t.replace('\u0964', '.').replace('\u0965', '.')
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (s.isEmpty()) return s
+        val core = s.trimEnd('"', '\'', '\u201D', '\u2019', ')', ' ')
+        val last = core.lastOrNull() ?: return ""
+        return if (last in ".?!\u2026") s else "$core."
     }
 
     companion object {
+        /**
+         * How many refinement steps the cloning model runs per line. 2 is the value the
+         * sherpa-onnx examples use: fast and clean. More steps = slower, a little smoother.
+         */
+        private const val CLONE_STEPS = 2
+
         /** (pitch in semitones, speed) for the 1st, 2nd, 3rd ... character on one speaker. */
         private val FEMALE_LOOK = listOf(0f to 1.00f, 2.0f to 1.06f, -1.5f to 0.95f, 3.5f to 1.10f)
         private val MALE_LOOK = listOf(0f to 1.00f, -2.0f to 0.95f, 1.5f to 1.06f, -3.5f to 0.92f)
