@@ -37,7 +37,7 @@ The dub panel shows the real error in a box (host, file, reason) and has a **Cop
 | Message | Meaning |
 |---|---|
 | `UnknownHostException: huggingface.co` / `github.com` | the phone's DNS or the network blocks that host: try another Wi-Fi / mobile data, or pick a DNS in Settings -> Network and Internet -> DNS mode |
-| `answered 404` | the file is not at that address: fix `SherpaModels.CLONE_BASES` |
+| `answered 404` | the file is not in the clone-model release yet: run the **Build clone model** workflow (and check the repository is public) |
 | `sent a web page instead of the file` | a captive portal / block page answered |
 | `the file was too small` | the same, or a cut file: it is deleted and the next address is tried |
 | `Network problem ... after 4 tries` | the connection keeps dropping: tap Try again, it continues from what is saved |
@@ -65,11 +65,24 @@ Kannada (`kn`) and Malayalam (`ml`). To switch one on, add its code to `SherpaMo
 (for example `setOf("hi", "mr")`). Men and women both come from the cloned voices in a language that has no
 Piper voices (a man's voice is the cloned voice moved lower). Listen to a few lines before shipping a new language.
 
-## If the model download address ever dies
+## Where the cloning model comes from (and what to do when the voices do not download)
 
-`SherpaModels.CLONE_BASES` is a list of folders; each file is tried in every folder, in order. Upload the 7 files
-(`lm_main.int8.onnx lm_flow.int8.onnx encoder.onnx decoder.int8.onnx text_conditioner.onnx vocab.json token_scores.json`)
-to any HTTPS folder you control (a GitHub release works) and add that folder, ending with `/`, to the list.
+The cloning model is the open model **Thanushttk/pocket-tts-multilingual** (CC-BY-4.0). The app does NOT
+download it from Hugging Face any more (the old converted copy, `dhruvs99/...`, was taken down and answers
+401). Instead the repository converts it itself and keeps the 7 files in its own release:
+
+1. GitHub -> **Actions** -> **Build clone model** -> **Run workflow** (about 15-30 minutes, run it once).
+2. The workflow downloads the open model, converts it, then LISTENS to it with the real sherpa-onnx engine
+   (two Hindi lines: must be spoken, not silent, not 40 seconds of noise). Only if that passes, it uploads
+   `lm_main.int8.onnx lm_flow.int8.onnx encoder.onnx decoder.int8.onnx text_conditioner.onnx vocab.json
+   token_scores.json` to the pre-release **clone-model** of the same repository, and attaches the test
+   voices (`clone-model-test-voices`) so you can hear them.
+3. The app downloads from `https://github.com/<repository>/releases/download/clone-model/` (the repository the
+   APK was built in, then `Updater.REPO`). **The repository must be public**, otherwise a phone cannot download
+   from it (the workflow prints a warning if so).
+
+If the workflow fails, nothing is published and the app keeps working with the Piper men's voices. Open the
+failed run, copy the last error lines from the step that is red, and fix / report that step.
 
 ## Build
 
