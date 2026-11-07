@@ -6,14 +6,17 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
+import com.hikari.app.net.DohDns
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
+import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 /**
  * One offline voice (run by sherpa-onnx):
@@ -66,6 +69,56 @@ object SherpaModels {
     private const val BASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
     private const val ESPEAK_URL = BASE + "espeak-ng-data.tar.bz2"
 
+    /** The full text of the last download problem (null after a good run). The dub panel shows it. */
+    @Volatile
+    var lastError: String? = null
+        private set
+
+    // Size of the parts, roughly in MB. Only used to place the progress bar: a part that is
+    // downloaded AND unpacked owns one slice of the bar, split into a download and an unpack
+    // share, so the bar only ever moves forward (it used to restart at 0% for every phase).
+    private const val V_DL = 60
+    private const val V_UN = 30
+    private const val ESPEAK_DL = 10
+    private const val ESPEAK_UN = 5
+    private const val CLONE_W = 170
+    private const val KOKORO_DL = 130
+    private const val KOKORO_UN = 70
+
+    /** Turns (percent of the current phase, unpacking?) into percent of a download+unpack part. */
+    private fun twoPhase(dl: Int, un: Int, p: Int, unpacking: Boolean): Int {
+        val whole = (dl + un).coerceAtLeast(1)
+        return if (!unpacking) p * dl / whole else (dl * 100 + p * un) / whole
+    }
+
+    /**
+     * ONE progress bar for the whole job. Finished parts add up and the shown value never
+     * goes back, whatever order the phases report in.
+     */
+    private class Overall(private val total: Int, private val out: (Int, Boolean) -> Unit) {
+        private var done = 0
+        private var shown = 0
+        private var shownUnpacking = false
+
+        @Synchronized
+        private fun emit(units: Int, unpacking: Boolean) {
+            val pct = (units * 100 / total.coerceAtLeast(1)).coerceIn(0, 100).coerceAtLeast(shown)
+            if (pct != shown || unpacking != shownUnpacking || units == 0) {
+                shown = pct
+                shownUnpacking = unpacking
+                out(pct, unpacking)
+            }
+        }
+
+        /** Runs one part worth [weight]; [work] reports 0..100 of that part. */
+        fun part(weight: Int, work: ((Int, Boolean) -> Unit) -> String?): String? {
+            val err = work { pct, unpacking -> emit(done + weight * pct.coerceIn(0, 100) / 100, unpacking) }
+            done += weight
+            emit(done, false)
+            return err
+        }
+    }
+
     /** Hindi Piper voices: two men. The first one is required, the second is a bonus. */
     val VOICES: List<PiperVoice> = listOf(
         PiperVoice("vits-piper-hi_IN-rohan-medium", Gender.MALE, "Rohan"),
@@ -103,6 +156,23 @@ object SherpaModels {
     private val CLONE_BASES = listOf(
         "https://huggingface.co/dhruvs99/pocket-tts-multilingual-sherpa-onnx/resolve/main/",
         "https://huggingface.co/dhruvs99/pocket-tts-multilingual-sherpa-onnx/resolve/main/sherpa-onnx-pocket-tts-multilingual-int8/",
+        // Last resort when huggingface.co itself cannot be reached from the phone's network.
+        // A public mirror of the same repo (same paths). Delete this line if you do not want it.
+        "https://hf-mirror.com/dhruvs99/pocket-tts-multilingual-sherpa-onnx/resolve/main/",
+    )
+
+    /**
+     * Smallest believable size (bytes) of each cloning file. A saved file below this is an
+     * error page or a cut file, never the model, so it is thrown away instead of being kept.
+     */
+    private val CLONE_MIN_BYTES: Map<String, Long> = mapOf(
+        "lm_main.int8.onnx" to 40_000_000L,
+        "lm_flow.int8.onnx" to 5_000_000L,
+        "encoder.onnx" to 15_000_000L,
+        "decoder.int8.onnx" to 10_000_000L,
+        "text_conditioner.onnx" to 8_000_000L,
+        "vocab.json" to 1_000L,
+        "token_scores.json" to 1_000L,
     )
 
     /** The files of the cloning model and their approximate size in MB (for the progress bar). */
@@ -253,20 +323,25 @@ object SherpaModels {
      * Downloads (resuming a half-finished download) and unpacks the English
      * voices (Kokoro, about 130 MB). Same contract as [install].
      */
-    suspend fun installKokoro(c: Context, onProgress: (Int, Boolean) -> Unit): String? =
+    suspend fun installKokoro(
+        c: Context,
+        onProgress: (Int, Boolean) -> Unit,
+        onStep: (String) -> Unit = {},
+    ): String? =
         withContext(Dispatchers.IO) {
             if (isKokoroReady(c)) return@withContext null
+            onStep("English voices")
             val base = kokoroRoot(c).parentFile ?: return@withContext "Could not use the phone storage."
             base.mkdirs()
             if (base.usableSpace < 500_000_000L) {
                 return@withContext "Not enough free space (about 400 MB is needed)."
             }
             try {
-                installKokoroPack(c, onProgress)
+                installKokoroPack(c) { p, u -> onProgress(twoPhase(KOKORO_DL, KOKORO_UN, p, u), u) }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
-                "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+                "Voice download failed: " + describe(t)
             }
         }
 
@@ -317,7 +392,7 @@ object SherpaModels {
                 t.message.orEmpty().contains("space", ignoreCase = true) ||
                 finalDir.parentFile?.usableSpace.let { it != null && it < 100_000_000L }
             if (!noSpace) { part.delete(); marker.delete() }
-            return "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+            return "Voice download failed: " + describe(t)
         }
     }
 
@@ -331,7 +406,11 @@ object SherpaModels {
      * but the men are already on the phone, so [isInstalledFor] is still true and the dub
      * can start without the cloned women.
      */
-    suspend fun install(c: Context, onProgress: (Int, Boolean) -> Unit): String? =
+    suspend fun install(
+        c: Context,
+        onProgress: (Int, Boolean) -> Unit,
+        onStep: (String) -> Unit = {},
+    ): String? =
         withContext(Dispatchers.IO) {
             val base = root(c).apply { mkdirs() }
             // The first neural voice (Kokoro, 130-330 MB) is not used any more: free the space.
@@ -352,58 +431,76 @@ object SherpaModels {
                 return@withContext "Not enough free space (about " + (needBytes / 1_000_000L) + " MB is needed)."
             }
 
-            // weights of the parts, roughly their size in MB (only used for the progress bar)
-            val wVoice = 60
-            val wEspeak = 10
-            val wClone = 190
             val todo = VOICES.filter { !isVoiceReady(c, it) }
-            val total = (todo.size * wVoice + (if (espeakReady(c)) 0 else wEspeak) + (if (needClone) wClone else 0))
-                .coerceAtLeast(1)
-            var done = 0
-            fun report(pct: Int, weight: Int, unpacking: Boolean) {
-                onProgress(((done + weight * pct / 100) * 100 / total).coerceIn(0, 100), unpacking)
-            }
+            // The voice packs carry the espeak data themselves; it is only fetched on its own
+            // when every voice is there but the data is not.
+            val needEspeakAlone = todo.isEmpty() && !espeakReady(c)
+            val total = todo.size * (V_DL + V_UN) +
+                (if (needEspeakAlone) ESPEAK_DL + ESPEAK_UN else 0) +
+                (if (needClone) CLONE_W else 0)
+            val bar = Overall(total.coerceAtLeast(1), onProgress)
+            val steps = todo.size + (if (needEspeakAlone) 1 else 0) + (if (needClone) 1 else 0)
+            var stepNo = 0
 
             try {
                 for (v in todo) {
+                    stepNo++
+                    onStep("Step $stepNo of $steps: voice ${v.label}")
                     val required = VOICES.indexOf(v) < REQUIRED
-                    val err = installVoice(c, v) { p, u -> report(p, wVoice, u) }
-                    if (err != null) {
-                        if (required) return@withContext err
-                        // a bonus voice that cannot be fetched is skipped
+                    val err = bar.part(V_DL + V_UN) { cb ->
+                        installVoice(c, v) { p, u -> cb(twoPhase(V_DL, V_UN, p, u), u) }
                     }
-                    done += wVoice
+                    if (err != null && required) return@withContext err
+                    // a bonus voice that cannot be fetched is skipped
                 }
-                if (!espeakReady(c)) {
-                    val err = installEspeak(c) { p, u -> report(p, wEspeak, u) }
+                if (needEspeakAlone) {
+                    stepNo++
+                    onStep("Step $stepNo of $steps: language data")
+                    val err = bar.part(ESPEAK_DL + ESPEAK_UN) { cb ->
+                        installEspeak(c) { p, u -> cb(twoPhase(ESPEAK_DL, ESPEAK_UN, p, u), u) }
+                    }
                     if (err != null) return@withContext err
-                    done += wEspeak
                 }
                 if (!isInstalled(c)) return@withContext "The voice pack was incomplete. Tap again to retry."
                 if (needClone) {
-                    val err = installClonePack(c) { p, u -> report(p, wClone, u) }
+                    stepNo++
+                    onStep("Step $stepNo of $steps: cloning model (Myira, Kyra)")
+                    val err = bar.part(CLONE_W) { cb -> installClonePack(c, cb) }
                     if (err != null) return@withContext err
                 }
                 null
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
-                "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+                "Voice download failed: " + describe(t)
             }
         }
 
     /** Downloads whatever [lang] still needs (the dub panel calls this). Same contract as [install]. */
-    suspend fun installFor(c: Context, lang: String, onProgress: (Int, Boolean) -> Unit): String? =
-        when (lang.substringBefore('-').lowercase()) {
-            "en" -> installKokoro(c, onProgress)
-            "hi" -> install(c, onProgress)
-            else -> installCloneOnly(c, onProgress)
+    suspend fun installFor(
+        c: Context,
+        lang: String,
+        onProgress: (Int, Boolean) -> Unit,
+        onStep: (String) -> Unit = {},
+    ): String? {
+        val err = when (lang.substringBefore('-').lowercase()) {
+            "en" -> installKokoro(c, onProgress, onStep)
+            "hi" -> install(c, onProgress, onStep)
+            else -> installCloneOnly(c, onProgress, onStep)
         }
+        lastError = err
+        return err
+    }
 
     /** Only the cloning model (for a language that has no Piper voices). Same contract as [install]. */
-    suspend fun installCloneOnly(c: Context, onProgress: (Int, Boolean) -> Unit): String? =
+    suspend fun installCloneOnly(
+        c: Context,
+        onProgress: (Int, Boolean) -> Unit,
+        onStep: (String) -> Unit = {},
+    ): String? =
         withContext(Dispatchers.IO) {
             if (isCloneReady(c)) return@withContext null
+            onStep("Cloning model")
             val base = cloneRoot(c).parentFile ?: return@withContext "Could not use the phone storage."
             base.mkdirs()
             if (base.usableSpace < 350_000_000L) {
@@ -414,7 +511,7 @@ object SherpaModels {
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
-                "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+                "Voice download failed: " + describe(t)
             }
         }
 
@@ -437,27 +534,40 @@ object SherpaModels {
             for ((name, mb) in CLONE_FILES) {
                 val dest = File(staging, name)
                 val finished = File(staging, "$name.finished")
-                if (dest.length() > 0 && finished.exists()) {
+                val minBytes = CLONE_MIN_BYTES[name] ?: 1L
+                if (dest.length() >= minBytes && finished.exists()) {
                     doneMb += mb
                     onProgress(doneMb * 100 / totalMb, false)
                     continue
                 }
+                // a file marked finished that is too small is junk: start it again
+                dest.delete(); finished.delete()
                 val part = File(staging, "$name.part")
                 val marker = File(staging, "$name.part.whole")
-                var lastErr: String? = "Download failed."
+                val problems = ArrayList<String>()
+                var ok = false
                 for (b in CLONE_BASES) {
-                    lastErr = try {
+                    val err = try {
                         download(b + name, part, marker) { p, _ ->
                             onProgress((doneMb + mb * p / 100) * 100 / totalMb, false)
                         }
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (t: Throwable) {
-                        "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+                        "Voice download failed: " + describe(t)
                     }
-                    if (lastErr == null) break
+                    if (err == null) {
+                        // the file must really be the model, not an error page or a cut file
+                        if (part.length() >= minBytes) { ok = true; break }
+                        problems.add(hostOf(b) + ": the file was too small (" + part.length() + " bytes)")
+                        part.delete(); marker.delete()
+                    } else {
+                        problems.add(hostOf(b) + ": " + err)
+                    }
                 }
-                if (lastErr != null) return lastErr
+                if (!ok) {
+                    return "Could not download $name. " + problems.joinToString(" | ")
+                }
                 dest.delete()
                 if (!part.renameTo(dest)) return "Could not save the voice file $name."
                 marker.delete()
@@ -467,8 +577,7 @@ object SherpaModels {
             }
             for ((name, _) in CLONE_FILES) {
                 val f = File(staging, name)
-                val tooSmall = if (name.endsWith(".onnx")) f.length() < 100_000L else f.length() < 50L
-                if (tooSmall) {
+                if (f.length() < (CLONE_MIN_BYTES[name] ?: 1L)) {
                     // something is wrong with what was saved: start clean next time
                     staging.deleteRecursively()
                     return "The cloning model was incomplete. Tap again to retry."
@@ -487,7 +596,7 @@ object SherpaModels {
         } catch (ce: CancellationException) {
             throw ce      // the half-finished files stay, the next try continues
         } catch (t: Throwable) {
-            return "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+            return "Voice download failed: " + describe(t)
         }
     }
 
@@ -565,7 +674,7 @@ object SherpaModels {
                 t.message.orEmpty().contains("space", ignoreCase = true) ||
                 root(c).usableSpace < 100_000_000L
             if (!noSpace) { part.delete(); marker.delete() }
-            return "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+            return "Voice download failed: " + describe(t)
         }
     }
 
@@ -605,16 +714,51 @@ object SherpaModels {
         } catch (t: Throwable) {
             staging.deleteRecursively()
             part.delete(); marker.delete()
-            return "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+            return "Voice download failed: " + describe(t)
         }
     }
 
     // ───────────────────────── download / unpack ─────────────────────────
 
+    /** One client for every voice download: the app's own DNS (with the DNS-over-HTTPS fallback). */
+    private val net: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .dns(DohDns)
+            .build()
+    }
+
+    private const val TRIES = 4
+
+    private fun hostOf(url: String): String = url.substringAfter("://").substringBefore('/')
+
+    /** A short, readable reason for the person (and for me when they send it back). */
+    private fun describe(t: Throwable): String {
+        val name = t.javaClass.simpleName
+        val msg = t.message?.takeIf { it.isNotBlank() }
+        return if (msg != null && !msg.startsWith(name)) "$name: $msg" else name
+    }
+
+    private fun CoroutineScope.sleepAlive(ms: Long) {
+        var left = ms
+        while (left > 0) {
+            ensureActive()
+            val step = minOf(left, 200L)
+            Thread.sleep(step)
+            left -= step
+        }
+    }
+
     /**
-     * Downloads [url] into [part] (resuming when a part is there).
+     * Downloads [url] into [part], resuming when a part is there, and tries again (continuing
+     * from what is already saved) when the connection drops or times out.
      * Returns null when the whole file is on the phone (and writes [marker]),
-     * otherwise a short message for the person.
+     * otherwise a short message for the person that says what went wrong.
      */
     private fun CoroutineScope.download(
         url: String,
@@ -622,61 +766,91 @@ object SherpaModels {
         marker: File,
         onProgress: (Int, Boolean) -> Unit,
     ): String? {
+        var last = "Download failed."
+        for (attempt in 1..TRIES) {
+            ensureActive()
+            try {
+                return downloadOnce(url, part, marker, onProgress)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: IOException) {
+                last = "Network problem (" + describe(e) + ")"
+                if (attempt < TRIES) sleepAlive(1500L * attempt)
+            }
+        }
+        return "$last after $TRIES tries. What is saved is kept, tap again to continue."
+    }
+
+    /**
+     * One try. Returns null (whole file saved) or a message for a failure that is no use
+     * retrying (the file does not exist, a web page came back...). Throws [IOException]
+     * for a failure that is worth another try (dropped connection, timeout, server busy).
+     */
+    private fun CoroutineScope.downloadOnce(
+        url: String,
+        part: File,
+        marker: File,
+        onProgress: (Int, Boolean) -> Unit,
+    ): String? {
         marker.delete()
         val have = if (part.exists()) part.length() else 0L
-        var conn = openFollowing(url, have)
-        var code = conn.responseCode
-        var resumeFrom = have
-
-        if (code == 416) {
-            // "Range not satisfiable": the saved file is already whole (or damaged).
-            val range = conn.getHeaderField("Content-Range")
-            conn.disconnect()
-            val serverTotal = range?.substringAfter('/', "")?.trim()?.toLongOrNull()
-            if (serverTotal == null || serverTotal == have) {
-                marker.writeText("1")
-                return null
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", "Hikari")
+            // no gzip: with a Range request the sizes stop matching and the file gets damaged
+            .header("Accept-Encoding", "identity")
+            .apply { if (have > 0) header("Range", "bytes=$have-") }
+            .build()
+        return net.newCall(req).execute().use { resp ->
+            val code = resp.code
+            if (code == 416) {
+                // "Range not satisfiable": the saved file is already whole (or damaged).
+                val serverTotal = resp.header("Content-Range")
+                    ?.substringAfter('/', "")?.trim()?.toLongOrNull()
+                if (serverTotal == null || serverTotal == have) {
+                    marker.writeText("1")
+                    return@use null
+                }
+                part.delete()
+                throw IOException("the saved part did not fit, starting that file again")
             }
-            part.delete()
-            resumeFrom = 0L
-            conn = openFollowing(url, 0L)
-            code = conn.responseCode
-        }
-
-        if (code != 200 && code != 206) {
-            conn.disconnect()
-            return "Download failed (server answered $code)."
-        }
-        val append = code == 206 && resumeFrom > 0
-        val len = conn.contentLengthLong
-        val total = if (len > 0) len + (if (append) resumeFrom else 0L) else -1L
-        var received = if (append) resumeFrom else 0L
-        var lastPct = -1
-        conn.inputStream.use { input ->
-            FileOutputStream(part, append).use { out ->
-                val buf = ByteArray(64 * 1024)
-                while (true) {
-                    ensureActive()
-                    val n = input.read(buf)
-                    if (n < 0) break
-                    out.write(buf, 0, n)
-                    received += n
-                    if (total > 0) {
-                        val p = (received * 100 / total).toInt().coerceIn(0, 100)
-                        if (p != lastPct) {
-                            lastPct = p
-                            onProgress(p, false)
+            if (code == 429 || code >= 500) throw IOException("server answered $code")
+            if (code != 200 && code != 206) {
+                return@use "Download failed (" + hostOf(url) + " answered $code for " + url.substringAfterLast('/') + ")."
+            }
+            val type = resp.header("Content-Type").orEmpty()
+            if (type.startsWith("text/html", ignoreCase = true)) {
+                return@use "Download blocked (" + hostOf(url) + " sent a web page instead of the file)."
+            }
+            val body = resp.body
+            val append = code == 206 && have > 0
+            val len = body.contentLength()
+            val total = if (len > 0) len + (if (append) have else 0L) else -1L
+            var received = if (append) have else 0L
+            var lastPct = -1
+            body.byteStream().use { input ->
+                FileOutputStream(part, append).use { out ->
+                    val buf = ByteArray(64 * 1024)
+                    while (true) {
+                        ensureActive()
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        out.write(buf, 0, n)
+                        received += n
+                        if (total > 0) {
+                            val p = (received * 100 / total).toInt().coerceIn(0, 100)
+                            if (p != lastPct) {
+                                lastPct = p
+                                onProgress(p, false)
+                            }
                         }
                     }
                 }
             }
+            if (total > 0 && part.length() < total) throw IOException("the download was cut off")
+            marker.writeText("1")
+            null
         }
-        conn.disconnect()
-        if (total > 0 && part.length() < total) {
-            return "Download was cut off. Tap again to continue."
-        }
-        marker.writeText("1")
-        return null
     }
 
     /**
@@ -733,29 +907,5 @@ object SherpaModels {
             }
         }
         onProgress(100, true)
-    }
-
-    /** Opens [url], following redirects by hand (GitHub hands out a signed link). */
-    private fun openFollowing(url: String, resumeFrom: Long): HttpURLConnection {
-        var u = url
-        var hops = 0
-        while (true) {
-            val conn = URL(u).openConnection() as HttpURLConnection
-            conn.instanceFollowRedirects = false
-            conn.connectTimeout = 30_000
-            conn.readTimeout = 60_000
-            conn.setRequestProperty("User-Agent", "Hikari")
-            if (resumeFrom > 0) conn.setRequestProperty("Range", "bytes=$resumeFrom-")
-            val code = conn.responseCode
-            if (code in 300..399 && hops < 6) {
-                val next = conn.getHeaderField("Location")
-                conn.disconnect()
-                if (next.isNullOrBlank()) return conn
-                u = URL(URL(u), next).toString()
-                hops++
-                continue
-            }
-            return conn
-        }
     }
 }
