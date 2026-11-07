@@ -43,14 +43,14 @@ data class PiperVoice(
  *  - Hindi men: two real Piper speakers (Rohan, Pratham). Piper is MUCH faster than
  *    the Kokoro pack that used to be here (a line is made in a fraction of the time it
  *    takes to say it).
- *  - Hindi women: two CLONED voices, Myira and Kyra. They are made by the Pocket TTS
- *    multilingual model from the two reference recordings that ship inside the APK
- *    (assets/dub/voices/myira.wav and kyra.wav), so they sound like those recordings.
- *    The old Piper woman (Priyamvada) is gone for good.
+ *  - Hindi women: one real Piper speaker (Priyamvada, fast) and two CLONED voices, Myira
+ *    and Kyra. The cloned ones are made by the Pocket TTS multilingual model from the two
+ *    reference recordings that ship inside the APK (assets/dub/voices/myira.wav and
+ *    kyra.wav), so they sound like those recordings.
  *  - English: two Kokoro speakers (unchanged).
  *
  * Nothing big is inside the APK. The first time, [install] downloads what is missing
- * (about 120 MB for the two men, about 190 MB for the cloning model) and unpacks it
+ * (about 60 MB per Piper voice, about 190 MB for the cloning model) and unpacks it
  * into the app's private folder:
  *
  *   dub_models/piper-hi/espeak-ng-data/          (shared by the Piper voices)
@@ -119,15 +119,21 @@ object SherpaModels {
         }
     }
 
-    /** Hindi Piper voices: two men. The first one is required, the second is a bonus. */
+    /**
+     * Hindi Piper voices: two men and one woman. The first one is required, the others are
+     * bonuses (if one cannot be downloaded the dub simply has one actor fewer). Priyamvada is
+     * listed first among the women, so she is the main (unnamed) woman's voice: she is fast and
+     * never makes the dub fall behind, unlike the cloned women.
+     */
     val VOICES: List<PiperVoice> = listOf(
         PiperVoice("vits-piper-hi_IN-rohan-medium", Gender.MALE, "Rohan"),
         PiperVoice("vits-piper-hi_IN-pratham-medium", Gender.MALE, "Pratham"),
+        PiperVoice("vits-piper-hi_IN-priyamvada-medium", Gender.FEMALE, "Priyamvada"),
     )
     private const val REQUIRED = 1
 
     /** Voices that were shipped before and are gone for good (deleted from the phone when found). */
-    private val REMOVED_VOICE_IDS = listOf("vits-piper-hi_IN-priyamvada-medium")
+    private val REMOVED_VOICE_IDS: List<String> = emptyList()
 
     // ───────────────────────── Cloned voices (Pocket TTS) ─────────────────────────
 
@@ -286,7 +292,8 @@ object SherpaModels {
     fun isFullyInstalledFor(c: Context, lang: String): Boolean {
         val b = lang.substringBefore('-').lowercase()
         return when {
-            b == "hi" -> isInstalled(c) && isCloneReady(c)
+            // every Piper voice (men and Priyamvada) AND the cloning model
+            b == "hi" -> isInstalled(c) && VOICES.all { isVoiceReady(c, it) } && isCloneReady(c)
             b == "en" -> isKokoroReady(c)
             b in CLONE_LANGS -> isCloneReady(c)
             else -> false
@@ -424,10 +431,9 @@ object SherpaModels {
                 File(models, "kokoro-multi-lang-v1_0").deleteRecursively()
                 c.cacheDir.listFiles()?.filter { it.name.startsWith("kokoro") }?.forEach { it.delete() }
             }
-            // The old Piper woman is gone for good.
             cleanupRemoved(c)
 
-            val needPiper = !isInstalled(c)
+            val needPiper = !isInstalled(c) || VOICES.any { !isVoiceReady(c, it) }
             val needClone = !isCloneReady(c)
             val needBytes = (if (needPiper) 300_000_000L else 0L) + (if (needClone) 350_000_000L else 0L)
             if (needBytes > 0L && base.usableSpace < needBytes) {
