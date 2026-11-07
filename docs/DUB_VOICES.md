@@ -8,16 +8,18 @@
 | Kyra | woman | Pocket TTS (voice cloning) | `app/src/main/assets/dub/voices/kyra.wav` |
 | Rohan | man | Piper | downloaded once |
 | Pratham | man | Piper | downloaded once |
+| Priyamvada | woman | Piper (`vits-piper-hi_IN-priyamvada-medium`) | downloaded once |
 
-The old Piper woman (Priyamvada) is gone. Her files are deleted from the phone on the next start
-(`SherpaModels.cleanupRemoved`).
+Priyamvada is a real Piper voice, so she is as fast as the men. She is listed first among the women
+(`SherpaModels.VOICES`), so she is the main woman's voice; Myira and Kyra are the next women. If the cloned
+women turn out too slow on a phone, the dub puts them aside for that run and every woman's line uses Priyamvada.
 
 English still uses the two Kokoro voices, nothing changed there.
 
 ## How the cloning works
 
 1. Subtitle line -> translated to Hindi (as before).
-2. `SherpaTtsVoice` picks the actor of that character. A woman gets Myira / Kyra, a man gets Rohan / Pratham.
+2. `SherpaTtsVoice` picks the actor of that character. A woman gets Priyamvada / Myira / Kyra, a man gets Rohan / Pratham.
 3. For Myira / Kyra the helper process (`NeuralTtsService`) runs sherpa-onnx **Pocket TTS** with the
    actor's recording as the voice prompt (`GenerationConfig.referenceAudio`). The model speaks the
    translated line in the voice of that recording.
