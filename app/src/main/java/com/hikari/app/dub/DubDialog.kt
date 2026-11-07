@@ -2,6 +2,8 @@ package com.hikari.app.dub
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.view.View
 import android.view.WindowManager
@@ -251,13 +253,18 @@ internal object NeuralDownload {
         val english = base == "en"
         val hindi = base == "hi"
 
-        val status = TextView(activity).apply {
+        val info = TextView(activity).apply {
             textSize = 13f
             text = when {
                 english -> I18n.t("Downloading the English voices once (2 voices, about 130 MB). Keep this screen open and stay on Wi-Fi.")
                 hindi -> I18n.t("Downloading the Hindi voices once (2 men + the cloning model for the 2 cloned women, about 300 MB). Keep this screen open and stay on Wi-Fi.")
                 else -> I18n.t("Downloading the cloning model once (about 170 MB). Keep this screen open and stay on Wi-Fi.")
             }
+        }
+        // "Downloading… 37%" / "Unpacking… 52%": the bar is one bar for the whole job and only goes forward
+        val status = TextView(activity).apply {
+            textSize = 13f
+            setPadding(0, pad(10), 0, 0)
         }
         val bar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
@@ -267,6 +274,7 @@ internal object NeuralDownload {
         val box = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad(20), pad(12), pad(20), pad(4))
+            addView(info)
             addView(status)
             addView(bar)
         }
@@ -297,8 +305,38 @@ internal object NeuralDownload {
                     status.text = (if (unpacking) I18n.t("Unpacking") else I18n.t("Downloading")) + "… " + pct + "%"
                 }
             }
-            val err = SherpaModels.installFor(activity.applicationContext, lang, progress)
+            val step: (String) -> Unit = { text ->
+                activity.runOnUiThread {
+                    info.text = text + "\n" + I18n.t("Keep this screen open and stay on Wi-Fi.")
+                }
+            }
+            val err = SherpaModels.installFor(activity.applicationContext, lang, progress, step)
             runCatching { dlg.dismiss() }
+
+            // The whole error text, in a box that stays until the person closes it
+            // (a toast cuts it short, so the real reason was never visible).
+            fun problem(title: String, text: String, canDub: Boolean) {
+                if (activity.isFinishing) { onDone(canDub); return }
+                val b = AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle(title)
+                    .setMessage(text)
+                    .setCancelable(false)
+                    // the click is set again below, so Copy does not close the box
+                    .setNeutralButton(I18n.t("Copy"), null)
+                    .setNegativeButton(I18n.t("Try again")) { _, _ -> show(activity, lang, onDone) }
+                if (canDub) b.setPositiveButton(I18n.t("Dub with the ready voices")) { _, _ -> onDone(true) }
+                else b.setPositiveButton(I18n.t("Close")) { _, _ -> onDone(false) }
+                val box2 = b.create()
+                box2.show()
+                box2.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+                    runCatching {
+                        val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("voice download", text))
+                        Toast.makeText(activity, I18n.t("Copied"), Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+
             when {
                 err == null -> {
                     Toast.makeText(activity, I18n.t("Neural voice is ready."), Toast.LENGTH_SHORT).show()
@@ -306,18 +344,12 @@ internal object NeuralDownload {
                 }
                 // Part of it failed (for Hindi: the cloned women could not be fetched) but
                 // there are neural voices on the phone: dub with those, and say what happened.
-                SherpaModels.isInstalledFor(activity.applicationContext, lang) -> {
-                    Toast.makeText(
-                        activity,
-                        I18n.t("Some voices could not be downloaded, so the dub uses the voices that are ready.") + "\n" + err,
-                        Toast.LENGTH_LONG,
-                    ).show()
-                    onDone(true)
-                }
-                else -> {
-                    Toast.makeText(activity, err, Toast.LENGTH_LONG).show()
-                    onDone(false)
-                }
+                SherpaModels.isInstalledFor(activity.applicationContext, lang) -> problem(
+                    I18n.t("Some voices could not be downloaded, so the dub uses the voices that are ready."),
+                    err.orEmpty(),
+                    true,
+                )
+                else -> problem(I18n.t("The voice download did not finish"), err.orEmpty(), false)
             }
         }
         job = running
