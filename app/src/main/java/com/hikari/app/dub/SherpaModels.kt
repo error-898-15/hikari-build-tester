@@ -16,8 +16,13 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * One offline voice (run by sherpa-onnx): a Hindi Piper voice, or an English
- * Kokoro voice ([kokoro] = true; [sid] is its speaker number inside the Kokoro pack).
+ * One offline voice (run by sherpa-onnx):
+ *  - a Hindi Piper voice (a fixed speaker),
+ *  - an English Kokoro voice ([kokoro] = true; [sid] is its speaker number inside the Kokoro pack),
+ *  - a CLONED voice ([clone] = true): the Pocket TTS model speaks in the voice of the
+ *    reference recording [ref] (an asset path like "dub/voices/myira.wav", or an absolute
+ *    file path). The voice of the recording is what you hear, in every language the
+ *    model speaks. See [SherpaModels.CLONE_VOICES].
  */
 data class PiperVoice(
     val id: String,
@@ -25,36 +30,124 @@ data class PiperVoice(
     val label: String,
     val sid: Int = 0,
     val kokoro: Boolean = false,
+    val clone: Boolean = false,
+    val ref: String = "",
 )
 
 /**
- * The offline neural voices (Piper, run through sherpa-onnx): three real,
- * different Hindi speakers. Piper is MUCH faster than the Kokoro pack that
- * used to be here (a line is made in a fraction of the time it takes to say
- * it), which is what lets a whole video be voiced in a minute or two.
+ * The offline neural voices (run through sherpa-onnx):
  *
- * Nothing is inside the APK. The first time, [install] downloads the three
- * voices (about 60 MB each) from the official sherpa-onnx releases page on
- * GitHub, once, and unpacks them into the app's private folder:
+ *  - Hindi men: two real Piper speakers (Rohan, Pratham). Piper is MUCH faster than
+ *    the Kokoro pack that used to be here (a line is made in a fraction of the time it
+ *    takes to say it).
+ *  - Hindi women: two CLONED voices, Myira and Kyra. They are made by the Pocket TTS
+ *    multilingual model from the two reference recordings that ship inside the APK
+ *    (assets/dub/voices/myira.wav and kyra.wav), so they sound like those recordings.
+ *    The old Piper woman (Priyamvada) is gone for good.
+ *  - English: two Kokoro speakers (unchanged).
  *
- *   dub_models/piper-hi/espeak-ng-data/          (shared by all voices)
+ * Nothing big is inside the APK. The first time, [install] downloads what is missing
+ * (about 120 MB for the two men, about 190 MB for the cloning model) and unpacks it
+ * into the app's private folder:
+ *
+ *   dub_models/piper-hi/espeak-ng-data/          (shared by the Piper voices)
  *   dub_models/piper-hi/voices/<id>/model.onnx + tokens.txt
+ *   dub_models/pocket-multi/lm_main.int8.onnx ... (the cloning model, see [CLONE_FILES])
  *
- * The first two voices are required; the third one is a bonus (if it cannot
- * be downloaded the dub simply has one actor fewer).
+ * The first Piper voice (Rohan) is required; the second one is a bonus (if it cannot
+ * be downloaded the dub simply has one actor fewer). The cloning model is also
+ * downloaded, but if that fails the dub still works with the Piper men (see [isInstalledFor]).
+ *
+ * More languages later: the cloning model already speaks Marathi, Tamil, Telugu, Kannada
+ * and Malayalam too. Put a language code into [CLONE_LANGS] to switch it on.
  */
 object SherpaModels {
 
     private const val BASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
     private const val ESPEAK_URL = BASE + "espeak-ng-data.tar.bz2"
 
-    /** Order matters: 1 woman, 1 man (required), then a second man (bonus). */
+    /** Hindi Piper voices: two men. The first one is required, the second is a bonus. */
     val VOICES: List<PiperVoice> = listOf(
-        PiperVoice("vits-piper-hi_IN-priyamvada-medium", Gender.FEMALE, "Priyamvada"),
         PiperVoice("vits-piper-hi_IN-rohan-medium", Gender.MALE, "Rohan"),
         PiperVoice("vits-piper-hi_IN-pratham-medium", Gender.MALE, "Pratham"),
     )
-    private const val REQUIRED = 2
+    private const val REQUIRED = 1
+
+    /** Voices that were shipped before and are gone for good (deleted from the phone when found). */
+    private val REMOVED_VOICE_IDS = listOf("vits-piper-hi_IN-priyamvada-medium")
+
+    // ───────────────────────── Cloned voices (Pocket TTS) ─────────────────────────
+
+    /**
+     * Cloned actors. [PiperVoice.ref] is the recording whose voice is copied. To add a
+     * voice: put a clean 24 kHz mono 16-bit WAV (6 to 12 seconds of one person talking)
+     * into app/src/main/assets/dub/voices/ and add a line here.
+     */
+    val CLONE_VOICES: List<PiperVoice> = listOf(
+        PiperVoice("clone-myira", Gender.FEMALE, "Myira", clone = true, ref = "dub/voices/myira.wav"),
+        PiperVoice("clone-kyra", Gender.FEMALE, "Kyra", clone = true, ref = "dub/voices/kyra.wav"),
+    )
+
+    /**
+     * Languages the cloned voices speak in the dub. The Pocket TTS multilingual model can do
+     * hi, en, mr, ta, te, kn and ml. Only Hindi is switched on now; to add one, add its code
+     * here (English keeps its own Kokoro voices).
+     */
+    val CLONE_LANGS: Set<String> = setOf("hi")
+
+    /**
+     * Where the cloning model is downloaded from (a sherpa-onnx ready copy of the community
+     * model Thanushttk/pocket-tts-multilingual: Hindi, English, Marathi, Tamil, Telugu,
+     * Kannada, Malayalam). Each folder is tried in order, so a mirror can be added at the end.
+     */
+    private val CLONE_BASES = listOf(
+        "https://huggingface.co/dhruvs99/pocket-tts-multilingual-sherpa-onnx/resolve/main/",
+        "https://huggingface.co/dhruvs99/pocket-tts-multilingual-sherpa-onnx/resolve/main/sherpa-onnx-pocket-tts-multilingual-int8/",
+    )
+
+    /** The files of the cloning model and their approximate size in MB (for the progress bar). */
+    private val CLONE_FILES: List<Pair<String, Int>> = listOf(
+        "lm_main.int8.onnx" to 76,
+        "lm_flow.int8.onnx" to 10,
+        "encoder.onnx" to 40,
+        "decoder.int8.onnx" to 23,
+        "text_conditioner.onnx" to 16,
+        "vocab.json" to 1,
+        "token_scores.json" to 1,
+    )
+    private const val CLONE_DIR = "pocket-multi"
+
+    private fun cloneRoot(c: Context): File = File(File(c.filesDir, "dub_models"), CLONE_DIR)
+
+    /** Folder of the cloning model on the phone. */
+    fun cloneDir(c: Context): File = cloneRoot(c)
+
+    fun isCloneReady(c: Context): Boolean {
+        val d = cloneRoot(c)
+        return File(d, ".ok").exists() && CLONE_FILES.all { File(d, it.first).length() > 0 }
+    }
+
+    /** The cloned voices that can be used right now for [lang]. */
+    fun readyCloneVoices(c: Context, lang: String): List<PiperVoice> =
+        if (lang.substringBefore('-').lowercase() in CLONE_LANGS && isCloneReady(c)) CLONE_VOICES else emptyList()
+
+    /** True when the neural voices speak [lang] at all (the dub panel asks this). */
+    fun supportsNeural(lang: String): Boolean {
+        val b = lang.substringBefore('-').lowercase()
+        return b == "hi" || b == "en" || b in CLONE_LANGS
+    }
+
+    /** Throws away voices that are not shipped any more (frees the space they used). */
+    fun cleanupRemoved(c: Context) {
+        runCatching {
+            for (id in REMOVED_VOICE_IDS) {
+                File(File(root(c), "voices"), id).deleteRecursively()
+                File(File(root(c), "voices"), "$id.tmp").deleteRecursively()
+                File(c.cacheDir, "$id.tar.bz2.part").delete()
+                File(c.cacheDir, "$id.tar.bz2.done").delete()
+            }
+        }
+    }
 
     // ───────────────────────── English voices (Kokoro) ─────────────────────────
 
@@ -89,20 +182,43 @@ object SherpaModels {
             File(kokoroEspeakDir(c), "phontab").exists()
     }
 
-    /** The voices that speak [lang] and are on the phone: Hindi = Piper, English = Kokoro. */
-    fun readyVoicesFor(c: Context, lang: String): List<PiperVoice> =
-        when (lang.substringBefore('-').lowercase()) {
-            "hi" -> readyVoices(c)
-            "en" -> if (isKokoroReady(c)) KOKORO_VOICES else emptyList()
-            else -> emptyList()
+    /**
+     * The voices that speak [lang] and are on the phone:
+     * Hindi = Piper men + cloned women, English = Kokoro.
+     */
+    fun readyVoicesFor(c: Context, lang: String): List<PiperVoice> {
+        val b = lang.substringBefore('-').lowercase()
+        return when {
+            b == "hi" -> readyVoices(c) + readyCloneVoices(c, lang)
+            b == "en" -> if (isKokoroReady(c)) KOKORO_VOICES else emptyList()
+            else -> readyCloneVoices(c, lang)
         }
+    }
 
-    fun isInstalledFor(c: Context, lang: String): Boolean =
-        when (lang.substringBefore('-').lowercase()) {
-            "hi" -> isInstalled(c)
-            "en" -> isKokoroReady(c)
+    /**
+     * True when there is something to dub [lang] with. For Hindi that is the Piper men OR
+     * the cloned women, so a dub still works when only one of the two downloads finished.
+     */
+    fun isInstalledFor(c: Context, lang: String): Boolean {
+        val b = lang.substringBefore('-').lowercase()
+        return when {
+            b == "hi" -> isInstalled(c) || isCloneReady(c)
+            b == "en" -> isKokoroReady(c)
+            b in CLONE_LANGS -> isCloneReady(c)
             else -> false
         }
+    }
+
+    /** True when EVERYTHING for [lang] is on the phone (nothing left to download). */
+    fun isFullyInstalledFor(c: Context, lang: String): Boolean {
+        val b = lang.substringBefore('-').lowercase()
+        return when {
+            b == "hi" -> isInstalled(c) && isCloneReady(c)
+            b == "en" -> isKokoroReady(c)
+            b in CLONE_LANGS -> isCloneReady(c)
+            else -> false
+        }
+    }
 
     private fun root(c: Context): File = File(File(c.filesDir, "dub_models"), "piper-hi")
 
@@ -129,6 +245,8 @@ object SherpaModels {
     fun delete(c: Context) {
         root(c).deleteRecursively()
         kokoroRoot(c).deleteRecursively()
+        cloneRoot(c).deleteRecursively()
+        File(File(c.filesDir, "dub_models"), "$CLONE_DIR.tmp").deleteRecursively()
     }
 
     /**
@@ -204,9 +322,14 @@ object SherpaModels {
     }
 
     /**
-     * Downloads (resuming a half-finished download) and unpacks the voices.
+     * Downloads (resuming a half-finished download) and unpacks what is missing for Hindi:
+     * the Piper men and the cloning model (the cloned women).
      * [onProgress] gets (percent 0..100 of the WHOLE job, unpacking?) from a
      * background thread. Returns null on success, otherwise a short message.
+     *
+     * The Piper men are required. If only the cloning model fails, the message is returned
+     * but the men are already on the phone, so [isInstalledFor] is still true and the dub
+     * can start without the cloned women.
      */
     suspend fun install(c: Context, onProgress: (Int, Boolean) -> Unit): String? =
         withContext(Dispatchers.IO) {
@@ -219,39 +342,154 @@ object SherpaModels {
                 File(models, "kokoro-multi-lang-v1_0").deleteRecursively()
                 c.cacheDir.listFiles()?.filter { it.name.startsWith("kokoro") }?.forEach { it.delete() }
             }
-            if (base.usableSpace < 450_000_000L && !isInstalled(c)) {
-                return@withContext "Not enough free space (about 300 MB is needed)."
+            // The old Piper woman is gone for good.
+            cleanupRemoved(c)
+
+            val needPiper = !isInstalled(c)
+            val needClone = !isCloneReady(c)
+            val needBytes = (if (needPiper) 300_000_000L else 0L) + (if (needClone) 350_000_000L else 0L)
+            if (needBytes > 0L && base.usableSpace < needBytes) {
+                return@withContext "Not enough free space (about " + (needBytes / 1_000_000L) + " MB is needed)."
             }
+
+            // weights of the parts, roughly their size in MB (only used for the progress bar)
+            val wVoice = 60
+            val wEspeak = 10
+            val wClone = 190
             val todo = VOICES.filter { !isVoiceReady(c, it) }
-            val steps = todo.size + (if (espeakReady(c)) 0 else 1)
-            var step = 0
-            fun report(pct: Int, unpacking: Boolean) {
-                val total = steps.coerceAtLeast(1)
-                onProgress(((step * 100 + pct) / total).coerceIn(0, 100), unpacking)
+            val total = (todo.size * wVoice + (if (espeakReady(c)) 0 else wEspeak) + (if (needClone) wClone else 0))
+                .coerceAtLeast(1)
+            var done = 0
+            fun report(pct: Int, weight: Int, unpacking: Boolean) {
+                onProgress(((done + weight * pct / 100) * 100 / total).coerceIn(0, 100), unpacking)
             }
 
             try {
                 for (v in todo) {
                     val required = VOICES.indexOf(v) < REQUIRED
-                    val err = installVoice(c, v) { p, u -> report(p, u) }
+                    val err = installVoice(c, v) { p, u -> report(p, wVoice, u) }
                     if (err != null) {
                         if (required) return@withContext err
                         // a bonus voice that cannot be fetched is skipped
                     }
-                    step++
+                    done += wVoice
                 }
                 if (!espeakReady(c)) {
-                    val err = installEspeak(c) { p, u -> report(p, u) }
+                    val err = installEspeak(c) { p, u -> report(p, wEspeak, u) }
                     if (err != null) return@withContext err
-                    step++
+                    done += wEspeak
                 }
-                if (!isInstalled(c)) "The voice pack was incomplete. Tap again to retry." else null
+                if (!isInstalled(c)) return@withContext "The voice pack was incomplete. Tap again to retry."
+                if (needClone) {
+                    val err = installClonePack(c) { p, u -> report(p, wClone, u) }
+                    if (err != null) return@withContext err
+                }
+                null
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
                 "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
             }
         }
+
+    /** Downloads whatever [lang] still needs (the dub panel calls this). Same contract as [install]. */
+    suspend fun installFor(c: Context, lang: String, onProgress: (Int, Boolean) -> Unit): String? =
+        when (lang.substringBefore('-').lowercase()) {
+            "en" -> installKokoro(c, onProgress)
+            "hi" -> install(c, onProgress)
+            else -> installCloneOnly(c, onProgress)
+        }
+
+    /** Only the cloning model (for a language that has no Piper voices). Same contract as [install]. */
+    suspend fun installCloneOnly(c: Context, onProgress: (Int, Boolean) -> Unit): String? =
+        withContext(Dispatchers.IO) {
+            if (isCloneReady(c)) return@withContext null
+            val base = cloneRoot(c).parentFile ?: return@withContext "Could not use the phone storage."
+            base.mkdirs()
+            if (base.usableSpace < 350_000_000L) {
+                return@withContext "Not enough free space (about 350 MB is needed)."
+            }
+            try {
+                installClonePack(c, onProgress)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+            }
+        }
+
+    // ───────────────────────── the cloning model ─────────────────────────
+
+    /**
+     * Downloads the cloning model (a handful of files, about 170 MB) into a staging folder
+     * and moves it into place when every file is whole. A file that was finished earlier is
+     * not fetched again and a half file is continued, so a cut connection costs nothing.
+     */
+    private fun CoroutineScope.installClonePack(c: Context, onProgress: (Int, Boolean) -> Unit): String? {
+        val finalDir = cloneRoot(c)
+        val staging = File(finalDir.parentFile, "$CLONE_DIR.tmp")
+        try {
+            staging.mkdirs()
+            var totalMb = 0
+            for (f in CLONE_FILES) totalMb += f.second
+            totalMb = totalMb.coerceAtLeast(1)
+            var doneMb = 0
+            for ((name, mb) in CLONE_FILES) {
+                val dest = File(staging, name)
+                val finished = File(staging, "$name.finished")
+                if (dest.length() > 0 && finished.exists()) {
+                    doneMb += mb
+                    onProgress(doneMb * 100 / totalMb, false)
+                    continue
+                }
+                val part = File(staging, "$name.part")
+                val marker = File(staging, "$name.part.whole")
+                var lastErr: String? = "Download failed."
+                for (b in CLONE_BASES) {
+                    lastErr = try {
+                        download(b + name, part, marker) { p, _ ->
+                            onProgress((doneMb + mb * p / 100) * 100 / totalMb, false)
+                        }
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (t: Throwable) {
+                        "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+                    }
+                    if (lastErr == null) break
+                }
+                if (lastErr != null) return lastErr
+                dest.delete()
+                if (!part.renameTo(dest)) return "Could not save the voice file $name."
+                marker.delete()
+                finished.writeText("1")
+                doneMb += mb
+                onProgress(doneMb * 100 / totalMb, false)
+            }
+            for ((name, _) in CLONE_FILES) {
+                val f = File(staging, name)
+                val tooSmall = if (name.endsWith(".onnx")) f.length() < 100_000L else f.length() < 50L
+                if (tooSmall) {
+                    // something is wrong with what was saved: start clean next time
+                    staging.deleteRecursively()
+                    return "The cloning model was incomplete. Tap again to retry."
+                }
+            }
+            staging.listFiles()?.forEach {
+                if (it.name.endsWith(".finished") || it.name.endsWith(".part") || it.name.endsWith(".whole")) it.delete()
+            }
+            File(staging, ".ok").writeText("1")
+            finalDir.deleteRecursively()
+            if (!staging.renameTo(finalDir)) {
+                staging.deleteRecursively()
+                return "Could not save the cloning model."
+            }
+            return null
+        } catch (ce: CancellationException) {
+            throw ce      // the half-finished files stay, the next try continues
+        } catch (t: Throwable) {
+            return "Voice download failed: " + (t.message ?: t.javaClass.simpleName)
+        }
+    }
 
     // ───────────────────────── one voice ─────────────────────────
 
