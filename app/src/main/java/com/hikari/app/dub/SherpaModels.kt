@@ -81,7 +81,7 @@ object SherpaModels {
     private const val V_UN = 30
     private const val ESPEAK_DL = 10
     private const val ESPEAK_UN = 5
-    private const val CLONE_W = 170
+    private const val CLONE_W = 200
     private const val KOKORO_DL = 130
     private const val KOKORO_UN = 70
 
@@ -149,17 +149,20 @@ object SherpaModels {
     val CLONE_LANGS: Set<String> = setOf("hi")
 
     /**
-     * Where the cloning model is downloaded from (a sherpa-onnx ready copy of the community
-     * model Thanushttk/pocket-tts-multilingual: Hindi, English, Marathi, Tamil, Telugu,
-     * Kannada, Malayalam). Each folder is tried in order, so a mirror can be added at the end.
+     * Where the cloning model is downloaded from. It is the open model
+     * Thanushttk/pocket-tts-multilingual (Hindi, English, Marathi, Tamil, Telugu, Kannada,
+     * Malayalam), converted to sherpa-onnx files by .github/workflows/clone-model.yml and kept in
+     * the "clone-model" release of YOUR repository, so nobody else's upload can take it away.
+     * Each folder is tried in order. The old Hugging Face copy (dhruvs99/...) answers 401
+     * now and was removed on purpose.
      */
-    private val CLONE_BASES = listOf(
-        "https://huggingface.co/dhruvs99/pocket-tts-multilingual-sherpa-onnx/resolve/main/",
-        "https://huggingface.co/dhruvs99/pocket-tts-multilingual-sherpa-onnx/resolve/main/sherpa-onnx-pocket-tts-multilingual-int8/",
-        // Last resort when huggingface.co itself cannot be reached from the phone's network.
-        // A public mirror of the same repo (same paths). Delete this line if you do not want it.
-        "https://hf-mirror.com/dhruvs99/pocket-tts-multilingual-sherpa-onnx/resolve/main/",
-    )
+    private val CLONE_BASES: List<String> by lazy {
+        val repos = ArrayList<String>()
+        val built = runCatching { com.hikari.app.BuildConfig.BUILD_REPO }.getOrDefault("")
+        if (built.isNotBlank()) repos.add(built)
+        if (com.hikari.app.net.Updater.REPO !in repos) repos.add(com.hikari.app.net.Updater.REPO)
+        repos.map { "https://github.com/$it/releases/download/clone-model/" }
+    }
 
     /**
      * Smallest believable size (bytes) of each cloning file. A saved file below this is an
@@ -179,7 +182,7 @@ object SherpaModels {
     private val CLONE_FILES: List<Pair<String, Int>> = listOf(
         "lm_main.int8.onnx" to 76,
         "lm_flow.int8.onnx" to 10,
-        "encoder.onnx" to 40,
+        "encoder.onnx" to 73,
         "decoder.int8.onnx" to 23,
         "text_conditioner.onnx" to 16,
         "vocab.json" to 1,
@@ -566,7 +569,9 @@ object SherpaModels {
                     }
                 }
                 if (!ok) {
-                    return "Could not download $name. " + problems.joinToString(" | ")
+                    return "Could not download $name. " + problems.joinToString(" | ") +
+                        " | The cloning model is kept in the clone-model release of the app's GitHub repository " +
+                        "(it must be public). If it is not there yet, run the \"Build clone model\" workflow once."
                 }
                 dest.delete()
                 if (!part.renameTo(dest)) return "Could not save the voice file $name."
