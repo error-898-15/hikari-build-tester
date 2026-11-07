@@ -1,3 +1,13 @@
+## 0.12.27 (continuous build only)
+
+### Dub audio: cloned Hindi voices
+- The old Hindi woman (Priyamvada) is removed completely (her files are deleted from the phone on the next start).
+- Two new women, **Myira** and **Kyra**, are cloned from the two voice samples: the Pocket TTS multilingual model speaks Hindi in the voice of each recording (`assets/dub/voices/myira.wav`, `kyra.wav`). Hindi men stay Rohan and Pratham (Piper).
+- Cloned voices are never bent afterwards: no pitch or speed change and no acting effects, so Myira and Kyra keep sounding like their samples after dubbing (a line that is too long for its slot is only sped up, without changing the pitch).
+- The first neural Hindi dub downloads the cloning model once (about 170 MB, Hugging Face); if that download fails the dub still works with the men's voices.
+- Built on sherpa-onnx 1.13.8 (was 1.12.13). More languages (Marathi, Tamil, Telugu, Kannada, Malayalam) are already in the model: add the code to `SherpaModels.CLONE_LANGS` to switch one on. See `docs/DUB_VOICES.md`.
+
+
 ## 0.12.26 (continuous build only)
 ## added
 - new Custom Background (BG) Option in Setting
