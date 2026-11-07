@@ -1,4 +1,18 @@
 
+
+
+## 0.12.28 (continuous build only)
+
+### Dub audio: every subtitle line is dubbed again (neural voice)
+- The Piper woman **Priyamvada** (`vits-piper-hi_IN-priyamvada-medium`) is back, next to the cloned Myira and Kyra. She is fast and is the main woman's voice. Existing phones download her (about 60 MB) the next time "Start dubbing" is pressed with the neural voice.
+- A line is no longer lost when the line before it is still speaking: the dub looks at every line since the last spoken one and plays the next voiced line (up to 2.5 s after its subtitle ended, sped up to catch up) instead of only checking the newest one.
+- The neural voice helper now has two lanes: the slow cloned women (Myira, Kyra) and the fast Piper / Kokoro voices are made at the same time, so a cloned line no longer keeps the whole video waiting behind it.
+- The voice threads no longer run at background priority (Android kept them on slow cores with a tiny share of the CPU while the video played).
+- If the cloned women are too slow on a phone (last 5 lines averaged more than 6 s each, see `CLONE_SLOW_MS`), they are put aside for that dub and the women's lines use the fast Piper woman (Priyamvada), so no line is skipped. The next dub tries the cloned women again.
+- The "safer" voice start mode (fewer voices kept in memory, which loads them again and again) is no longer kept for ever after one crash; the normal mode is tried again after 30 minutes.
+- The video no longer stops waiting for the voice for the rest of the video after two slow lines: it only stops for 30 s, then waits again.
+- Failed lines are retried up to 10 times (was 6) with a longer pause each time, and a translation that failed is retried twice at once before the line is put off.
+- The original dialogue stays out while a late dub line speaks, so the two voices never talk over each other.
 0.12.27 (continuous build only)
 Voice files are fetched with the app's own network client (the same DNS and DNS-over-HTTPS fallback as the rest of the app), ask for the plain file (no gzip, which broke resumed downloads), and try again up to 4 times, continuing from what is already saved, when the connection drops.
 Dub audio: voice download fixes
