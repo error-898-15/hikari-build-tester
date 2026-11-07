@@ -34,9 +34,6 @@ object DubPrefs {
     /** Own voice for every character + edited audio (on by default). */
     fun smart(c: Context): Boolean = p(c).getBoolean("smart", true)
     fun saveSmart(c: Context, v: Boolean) { p(c).edit().putBoolean("smart", v).apply() }
-    /** Listen to the ORIGINAL voices first, to tell men from women and to find the characters (on by default). */
-    fun scan(c: Context): Boolean = p(c).getBoolean("scan", true)
-    fun saveScan(c: Context, v: Boolean) { p(c).edit().putBoolean("scan", v).apply() }
     fun save(c: Context, lang: String, mode: VoiceMode, duck: Float) {
         p(c).edit().putString("lang", lang).putString("mode", mode.name).putFloat("duck2", duck).apply()
     }
@@ -73,7 +70,6 @@ object DubDialog {
         onUpload: () -> Unit,
         onStop: () -> Unit,
         onStart: (lang: String, mode: VoiceMode, duck: Float, multi: Boolean) -> Unit,
-        onGenerate: (() -> Unit)? = null,
     ) {
         val d = activity.resources.displayMetrics.density
         fun pad(v: Int) = (v * d).toInt()
@@ -116,13 +112,6 @@ object DubDialog {
             }
         }
 
-        // No usable subtitle: the voice of the video can write one.
-        if (!canStart && onGenerate != null) {
-            root.addView(
-                note(I18n.t("No subtitle for this video? Tap \"Make subtitle from voice\": the app listens to the sound of the video and writes the subtitle, then you can dub it."))
-            )
-        }
-
         // Which characters the subtitle names (only when its text is available).
         val castInfo = TextView(activity).apply {
             textSize = 12f
@@ -163,7 +152,7 @@ object DubDialog {
             I18n.t("Automatic (Google, then phone voice)"),
             I18n.t("Google Translate voice (online)"),
             I18n.t("Phone voice (offline)"),
-            I18n.t("Neural voice - offline, real actors (Hindi: 3 voices, English: 2 voices)"),
+            I18n.t("Neural voice - offline (Hindi: 2 cloned women + 2 men, English: 2 voices)"),
         )
         root.addView(label(I18n.t("Voice")))
         val voiceSpinner = spinner(voiceNames, DubPrefs.mode(activity).ordinal)
@@ -187,14 +176,6 @@ object DubDialog {
         }
         root.addView(smartBox)
 
-        // 6) listen to the original voices (man / woman and who is who)
-        val scanBox = CheckBox(activity).apply {
-            text = I18n.t("Listen to the original voices first (tells men from women; takes about 2 minutes, downloads a ~40 MB model once)")
-            isChecked = DubPrefs.scan(activity)
-            setPadding(0, pad(8), 0, 0)
-        }
-        root.addView(scanBox)
-
         val builder = AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle(I18n.t("Dub audio"))
             .setView(root)
@@ -211,13 +192,10 @@ object DubDialog {
                 val multi = smartBox.isChecked
                 DubPrefs.save(activity, lang, mode, duck)
                 DubPrefs.saveSmart(activity, multi)
-                DubPrefs.saveScan(activity, scanBox.isChecked)
-                val isHindi = lang.substringBefore('-').equals("hi", ignoreCase = true)
-                val isEnglish = lang.substringBefore('-').equals("en", ignoreCase = true)
                 when {
                     mode != VoiceMode.NEURAL -> onStart(lang, mode, duck, multi)
-                    !isHindi && !isEnglish -> {
-                        // The neural voices speak Hindi and English only for now.
+                    !SherpaModels.supportsNeural(lang) -> {
+                        // The neural voices speak Hindi and English for now.
                         Toast.makeText(
                             activity,
                             I18n.t("The neural voice is Hindi and English only for now, so the normal voice is used."),
@@ -225,36 +203,38 @@ object DubDialog {
                         ).show()
                         onStart(lang, VoiceMode.AUTO, duck, multi)
                     }
-                    SherpaModels.isInstalledFor(activity, lang) -> onStart(lang, mode, duck, multi)
-                    else -> NeuralDownload.show(activity, isEnglish) { ok ->
+                    SherpaModels.isFullyInstalledFor(activity, lang) -> onStart(lang, mode, duck, multi)
+                    else -> NeuralDownload.show(activity, lang) { ok ->
                         if (ok) onStart(lang, mode, duck, multi)
                     }
                 }
             }
-        } else if (onGenerate != null) {
-            builder.setPositiveButton(I18n.t("Make subtitle from voice")) { _, _ -> onGenerate.invoke() }
         }
         builder.show()
     }
 }
 
 /**
- * First use of the neural voice: downloads the voices once (Hindi: three
- * voices, about 190 MB; English: two voices, about 130 MB, from GitHub) and
- * shows the progress. [onDone] gets true when it is ready.
+ * First use of the neural voice: downloads what is missing once (Hindi: the two men and the
+ * cloning model for the two cloned women, about 300 MB; English: two voices, about 130 MB,
+ * from GitHub / Hugging Face) and shows the progress. [onDone] gets true when the dub can
+ * start (everything is ready, or at least the part that matters is: see below).
  */
 internal object NeuralDownload {
 
-    fun show(activity: Activity, english: Boolean, onDone: (Boolean) -> Unit) {
+    fun show(activity: Activity, lang: String, onDone: (Boolean) -> Unit) {
         val d = activity.resources.displayMetrics.density
         fun pad(v: Int) = (v * d).toInt()
+        val base = lang.substringBefore('-').lowercase()
+        val english = base == "en"
+        val hindi = base == "hi"
 
         val status = TextView(activity).apply {
             textSize = 13f
-            text = if (english) {
-                I18n.t("Downloading the English voices once (2 voices, about 130 MB). Keep this screen open and stay on Wi-Fi.")
-            } else {
-                I18n.t("Downloading the voices once (3 voices, about 190 MB). Keep this screen open and stay on Wi-Fi.")
+            text = when {
+                english -> I18n.t("Downloading the English voices once (2 voices, about 130 MB). Keep this screen open and stay on Wi-Fi.")
+                hindi -> I18n.t("Downloading the Hindi voices once (2 men + the cloning model for the 2 cloned women, about 300 MB). Keep this screen open and stay on Wi-Fi.")
+                else -> I18n.t("Downloading the cloning model once (about 170 MB). Keep this screen open and stay on Wi-Fi.")
             }
         }
         val bar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -272,7 +252,13 @@ internal object NeuralDownload {
         val scope = (activity as? LifecycleOwner)?.lifecycleScope ?: MainScope()
         var job: Job? = null
         val dlg = AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle(if (english) I18n.t("Neural voice (English)") else I18n.t("Neural voice (Hindi)"))
+            .setTitle(
+                when {
+                    english -> I18n.t("Neural voice (English)")
+                    hindi -> I18n.t("Neural voice (Hindi)")
+                    else -> I18n.t("Neural voice")
+                }
+            )
             .setView(box)
             .setCancelable(false)
             .setNegativeButton(I18n.t("Cancel")) { _, _ -> job?.cancel() }
@@ -289,18 +275,27 @@ internal object NeuralDownload {
                     status.text = (if (unpacking) I18n.t("Unpacking") else I18n.t("Downloading")) + "… " + pct + "%"
                 }
             }
-            val err = if (english) {
-                SherpaModels.installKokoro(activity.applicationContext, progress)
-            } else {
-                SherpaModels.install(activity.applicationContext, progress)
-            }
+            val err = SherpaModels.installFor(activity.applicationContext, lang, progress)
             runCatching { dlg.dismiss() }
-            if (err == null) {
-                Toast.makeText(activity, I18n.t("Neural voice is ready."), Toast.LENGTH_SHORT).show()
-                onDone(true)
-            } else {
-                Toast.makeText(activity, err, Toast.LENGTH_LONG).show()
-                onDone(false)
+            when {
+                err == null -> {
+                    Toast.makeText(activity, I18n.t("Neural voice is ready."), Toast.LENGTH_SHORT).show()
+                    onDone(true)
+                }
+                // Part of it failed (for Hindi: the cloned women could not be fetched) but
+                // there are neural voices on the phone: dub with those, and say what happened.
+                SherpaModels.isInstalledFor(activity.applicationContext, lang) -> {
+                    Toast.makeText(
+                        activity,
+                        I18n.t("Some voices could not be downloaded, so the dub uses the voices that are ready.") + "\n" + err,
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    onDone(true)
+                }
+                else -> {
+                    Toast.makeText(activity, err, Toast.LENGTH_LONG).show()
+                    onDone(false)
+                }
             }
         }
         job = running
