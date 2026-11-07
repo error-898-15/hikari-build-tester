@@ -79,6 +79,8 @@ internal object NeuralIpc {
     const val TRACE_FILE = "helper_trace.txt"
     const val K_OK = "ok"
     const val K_ERR = "err"
+    /** Answer of a voice request: how many ms the helper needed to make the line. */
+    const val K_MS = "ms"
 }
 
 /**
@@ -105,6 +107,20 @@ class NeuralTtsService : Service() {
     private class Reference(val samples: FloatArray, val rate: Int)
     private val references = HashMap<String, Reference>()
 
+    /**
+     * Two lanes make voices at the same time: the slow cloning model on one, the fast Piper /
+     * Kokoro voices on the other. A cloned line therefore never keeps the men's lines waiting
+     * (before, every line stood in ONE queue behind the slow cloned ones, so the dub could not
+     * keep up with the video and lines were skipped).
+     */
+    private var pocketLane: java.util.concurrent.ExecutorService? = null
+    private var voiceLane: java.util.concurrent.ExecutorService? = null
+
+    /** Keys of the engines that are making a line right now (never unloaded). Guarded by [engines]. */
+    private val busy = HashSet<String>()
+    /** Only one voice is loaded at a time (loading is the memory peak). */
+    private val loadLock = Any()
+
     override fun onCreate() {
         super.onCreate()
         trace("service started")
@@ -117,6 +133,28 @@ class NeuralTtsService : Service() {
         }
         handler = h
         messenger = Messenger(h)
+        pocketLane = newLane("neural-pocket")
+        voiceLane = newLane("neural-voice")
+    }
+
+    /**
+     * One thread that makes voices. NOT the background priority: at that priority Android keeps
+     * the thread on the slow cores with a small share of the CPU, which is what made the
+     * neural voice crawl while the video was playing.
+     */
+    private fun newLane(laneName: String): java.util.concurrent.ExecutorService {
+        val factory = java.util.concurrent.ThreadFactory { r ->
+            val t = Thread({
+                try {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)
+                } catch (e: Throwable) {
+                }
+                r.run()
+            }, laneName)
+            t.isDaemon = true
+            t
+        }
+        return java.util.concurrent.Executors.newSingleThreadExecutor(factory)
     }
 
     override fun onBind(intent: Intent?): IBinder? = messenger?.binder
@@ -124,11 +162,13 @@ class NeuralTtsService : Service() {
     override fun onDestroy() {
         for (flag in scans.values) flag.set(true)
         for (flag in gens.values) flag.set(true)
+        try { pocketLane?.shutdownNow() } catch (e: Throwable) {}
+        try { voiceLane?.shutdownNow() } catch (e: Throwable) {}
         val t = thread
         val h = handler
         if (t != null && h != null) {
             h.post {
-                trimEngines(0)
+                trimEngines(0, force = true)
                 t.quitSafely()
             }
         }
@@ -143,17 +183,22 @@ class NeuralTtsService : Service() {
         }
     }
 
-    private fun trimEngines(keep: Int) {
-        while (engines.size > keep) {
-            val key = engines.keys.first()
-            val e = engines.remove(key)
-            try { e?.release() } catch (t: Throwable) {}
+    /** Unloads the least recently used voices until [keep] are left; never one that is speaking now. */
+    private fun trimEngines(keep: Int, force: Boolean = false) {
+        synchronized(engines) {
+            val it = engines.entries.iterator()
+            while (engines.size > keep && it.hasNext()) {
+                val e = it.next()
+                if (!force && busy.contains(e.key)) continue
+                it.remove()
+                try { e.value.release() } catch (t: Throwable) {}
+            }
         }
     }
 
     private fun handle(msg: Message) {
         when (msg.what) {
-            NeuralIpc.MSG_SYNTH -> handleSynth(msg)
+            NeuralIpc.MSG_SYNTH -> dispatchSynth(msg)
             NeuralIpc.MSG_SCAN -> startScan(msg)
             NeuralIpc.MSG_SCAN_CANCEL -> {
                 val flag = scans[msg.data.getInt(NeuralIpc.K_ID)]
@@ -361,14 +406,36 @@ class NeuralTtsService : Service() {
         worker.start()
     }
 
-    private fun handleSynth(msg: Message) {
-        val data = msg.data
+    /** Hands a voice request to its lane (the message is recycled when this returns, so copy it first). */
+    private fun dispatchSynth(msg: Message) {
+        val data = Bundle(msg.data)
+        val replyTo = msg.replyTo
+        val lane = if (data.getString(NeuralIpc.K_KIND) == "pocket") pocketLane else voiceLane
+        if (lane == null) {
+            handleSynth(data, replyTo)
+            return
+        }
+        try {
+            lane.execute { handleSynth(data, replyTo) }
+        } catch (t: Throwable) {
+            val answer = Bundle()
+            answer.putInt(NeuralIpc.K_ID, data.getInt(NeuralIpc.K_ID))
+            answer.putBoolean(NeuralIpc.K_OK, false)
+            answer.putString(NeuralIpc.K_ERR, "the voice helper is shutting down")
+            val r = Message.obtain(null, NeuralIpc.MSG_RESULT)
+            r.data = answer
+            try { replyTo?.send(r) } catch (e: Throwable) {}
+        }
+    }
+
+    private fun handleSynth(data: Bundle, replyTo: Messenger?) {
         val id = data.getInt(NeuralIpc.K_ID)
         val answer = Bundle()
         answer.putInt(NeuralIpc.K_ID, id)
         try {
-            synth(data)
+            val tookMs = synth(data)
             answer.putBoolean(NeuralIpc.K_OK, true)
+            answer.putLong(NeuralIpc.K_MS, tookMs)
         } catch (t: Throwable) {
             trace("error: " + t.javaClass.simpleName + " " + (t.message ?: ""))
             answer.putBoolean(NeuralIpc.K_OK, false)
@@ -376,10 +443,11 @@ class NeuralTtsService : Service() {
         }
         val reply = Message.obtain(null, NeuralIpc.MSG_RESULT)
         reply.data = answer
-        try { msg.replyTo?.send(reply) } catch (e: Throwable) {}
+        try { replyTo?.send(reply) } catch (e: Throwable) {}
     }
 
-    private fun synth(b: Bundle) {
+    /** Makes one line. Returns how many ms the voice itself needed (without loading it). */
+    private fun synth(b: Bundle): Long {
         val dir = File(b.getString(NeuralIpc.K_DIR) ?: error("no voice folder"))
         // the espeak data folder (Piper / Kokoro only; the cloning model does not use it)
         val data = File(b.getString(NeuralIpc.K_DATA).orEmpty())
@@ -391,23 +459,28 @@ class NeuralTtsService : Service() {
         val kind = b.getString(NeuralIpc.K_KIND) ?: "piper"
         val pocket = kind == "pocket"
 
-        val engine = engineFor(dir, data, variant, kind)
+        val lease = acquireEngine(dir, data, variant, kind)
+        val engine = lease.engine
         val started = System.nanoTime()
         trace("speaking: " + dir.name + ", " + text.length + " characters")
-        val audio = if (pocket) {
-            val refPath = b.getString(NeuralIpc.K_REF) ?: error("no reference voice")
-            val ref = loadReference(refPath)
-            trace("cloning the voice of: " + refPath + " (" + (ref.samples.size * 1000L / ref.rate.coerceAtLeast(1)) + " ms)")
-            val cfg = GenerationConfig(
-                speed = 1.0f,
-                sid = 0,
-                referenceAudio = ref.samples,
-                referenceSampleRate = ref.rate,
-                numSteps = b.getInt(NeuralIpc.K_STEPS, 2).coerceIn(1, 8),
-            )
-            engine.generateWithConfig(text, cfg)
-        } else {
-            engine.generate(text = text, sid = sid, speed = speed)
+        val audio = try {
+            if (pocket) {
+                val refPath = b.getString(NeuralIpc.K_REF) ?: error("no reference voice")
+                val ref = loadReference(refPath)
+                trace("cloning the voice of: " + refPath + " (" + (ref.samples.size * 1000L / ref.rate.coerceAtLeast(1)) + " ms)")
+                val cfg = GenerationConfig(
+                    speed = 1.0f,
+                    sid = 0,
+                    referenceAudio = ref.samples,
+                    referenceSampleRate = ref.rate,
+                    numSteps = b.getInt(NeuralIpc.K_STEPS, 2).coerceIn(1, 8),
+                )
+                engine.generateWithConfig(text, cfg)
+            } else {
+                engine.generate(text = text, sid = sid, speed = speed)
+            }
+        } finally {
+            releaseEngine(lease)
         }
         val samples = audio.samples
         if (samples.isEmpty()) error("the voice returned no sound")
@@ -419,6 +492,7 @@ class NeuralTtsService : Service() {
         writeWav(tmp, samples, audio.sampleRate)
         if (out.exists()) out.delete()
         if (!tmp.renameTo(out)) error("could not save the audio")
+        return tookMs
     }
 
     /**
@@ -489,14 +563,46 @@ class NeuralTtsService : Service() {
      * [kind] is "piper", "kokoro" or "pocket" (see [NeuralIpc.K_KIND]). Both cloned women
      * share ONE loaded cloning model (the voice comes from the recording, not the model).
      */
-    private fun engineFor(dir: File, data: File, variant: Int, kind: String): OfflineTts {
+    private class Lease(val key: String, val engine: OfflineTts)
+
+    /**
+     * Gives the loaded voice for [dir] (loading it first if needed) and marks it as in use, so
+     * the other lane can never unload it while it speaks. Give it back with [releaseEngine].
+     */
+    private fun acquireEngine(dir: File, data: File, variant: Int, kind: String): Lease {
         val key = dir.path + "|" + variant
-        engines[key]?.let { return it }
+        synchronized(engines) {
+            val e = engines[key]
+            if (e != null) {
+                busy.add(key)
+                return Lease(key, e)
+            }
+        }
+        synchronized(loadLock) {
+            synchronized(engines) {
+                val e = engines[key]
+                if (e != null) {               // the other lane loaded it while we waited
+                    busy.add(key)
+                    return Lease(key, e)
+                }
+                // make room (a loaded voice costs about 100-150 MB)
+                val cap = when (variant) { 0 -> 3; 1 -> 2; else -> 1 }
+                trimEngines(cap - 1)
+            }
+            val created = createEngine(dir, data, variant, kind)
+            synchronized(engines) {
+                engines[key] = created
+                busy.add(key)
+            }
+            return Lease(key, created)
+        }
+    }
 
-        // make room (a loaded voice costs about 100-150 MB)
-        val cap = when (variant) { 0 -> 3; 1 -> 2; else -> 1 }
-        trimEngines(cap - 1)
+    private fun releaseEngine(lease: Lease) {
+        synchronized(engines) { busy.remove(lease.key) }
+    }
 
+    private fun createEngine(dir: File, data: File, variant: Int, kind: String): OfflineTts {
         val kokoro = kind == "kokoro"
         val pocket = kind == "pocket"
         val model = when {
@@ -563,7 +669,6 @@ class NeuralTtsService : Service() {
         val cfg = OfflineTtsConfig(model = modelCfg)
         val created = OfflineTts(config = cfg)
         trace("voice loaded: " + dir.name)
-        engines[key] = created
         return created
     }
 
