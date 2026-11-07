@@ -35,17 +35,30 @@ def make_tts(d: Path, enc: Path):
     return so, so.OfflineTts(so.OfflineTtsConfig(model=m))
 
 
-def speak(so, tts, text, ref, ref_sr):
-    cfg = None
-    for kw in (dict(reference_audio=ref, reference_sample_rate=ref_sr, num_steps=2, speed=1.0),
-               dict(reference_audio=ref, reference_sample_rate=ref_sr, num_steps=2)):
+def build_cfg(so, ref, ref_sr):
+    forms = []
+    for r in (ref, ref.tolist()):
+        forms.append(dict(reference_audio=r, reference_sample_rate=ref_sr, num_steps=2, speed=1.0))
+        forms.append(dict(reference_audio=r, reference_sample_rate=ref_sr, num_steps=2))
+    for kw in forms:
         try:
-            cfg = so.GenerationConfig(**kw)
-            break
+            return so.GenerationConfig(**kw)
         except Exception as e:  # noqa
-            print("GenerationConfig(%s) failed: %s" % (sorted(kw), e))
-    if cfg is None:
-        raise RuntimeError("cannot build GenerationConfig; sherpa_onnx has: " + str([n for n in dir(so) if "Gen" in n]))
+            print("GenerationConfig(%s, %s) failed: %s" % (sorted(kw), type(kw["reference_audio"]).__name__, e), flush=True)
+    # last try: empty config, then set the fields one by one
+    try:
+        cfg = so.GenerationConfig()
+        cfg.reference_audio = ref.tolist()
+        cfg.reference_sample_rate = ref_sr
+        cfg.num_steps = 2
+        return cfg
+    except Exception as e:  # noqa
+        print("GenerationConfig() + attributes failed: %s" % e, flush=True)
+    raise RuntimeError("cannot build GenerationConfig; sherpa_onnx has: " + str([n for n in dir(so) if "Gen" in n]))
+
+
+def speak(so, tts, text, ref, ref_sr):
+    cfg = build_cfg(so, ref, ref_sr)
     audio = tts.generate(text, cfg)
     return np.asarray(audio.samples, dtype=np.float32), int(audio.sample_rate)
 
@@ -90,7 +103,11 @@ def main():
                 print("SELF TEST PASSED with encoder variant:", tag)
                 return 0
         except Exception as e:  # noqa
+            import traceback
+            traceback.print_exc()
             print("[%s] crashed: %r" % (tag, e), flush=True)
+            print("::error title=Self test crashed::[%s] %r" % (tag, e), flush=True)
+    print("::error title=Self test::the model did not speak a normal Hindi line (see the numbers above) - nothing is published")
     print("SELF TEST FAILED - nothing is published.")
     return 1
 
