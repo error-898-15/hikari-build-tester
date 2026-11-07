@@ -30,6 +30,20 @@ The cloning model (about 170 MB, int8) is downloaded on the first neural Hindi d
 (`CLONE_FILES`, `CLONE_BASES`). If that download fails, Hindi neural dubbing still works with the men's voices
 and the app says so.
 
+## If the voices do not download
+
+The dub panel shows the real error in a box (host, file, reason) and has a **Copy** button. Typical reasons:
+
+| Message | Meaning |
+|---|---|
+| `UnknownHostException: huggingface.co` / `github.com` | the phone's DNS or the network blocks that host: try another Wi-Fi / mobile data, or pick a DNS in Settings -> Network and Internet -> DNS mode |
+| `answered 404` | the file is not at that address: fix `SherpaModels.CLONE_BASES` |
+| `sent a web page instead of the file` | a captive portal / block page answered |
+| `the file was too small` | the same, or a cut file: it is deleted and the next address is tried |
+| `Network problem ... after 4 tries` | the connection keeps dropping: tap Try again, it continues from what is saved |
+
+Everything downloaded so far is kept, so Try again never starts from zero.
+
 ## Add another cloned voice
 
 1. Record / cut 6 to 12 seconds of ONE person talking, clean, no music. Convert to WAV, 24 kHz, mono, 16-bit:
